@@ -57,7 +57,7 @@
     },
     "dreaming.phases.deep.maxPriorEntryLossFraction": {
       "label": "Maximum Prior Entry Loss",
-      "help": "Maximum fraction of prior MEMORY.md entries an accepted consolidation rewrite may remove."
+      "help": "Maximum fraction of prior MEMORY.md entries an accepted promotion write may remove."
     }
   },
   "configSchema": {
@@ -215,7 +215,7 @@
                     "type": "number",
                     "minimum": 0,
                     "maximum": 1,
-                    "description": "Maximum fraction of prior MEMORY.md entries a consolidation rewrite may remove before OpenClaw rejects it and uses append-only fallback."
+                    "description": "Maximum fraction of prior MEMORY.md entries a consolidation rewrite or append compaction may remove before OpenClaw rejects it. Append compaction only removes machine-generated promotion sections."
                   },
                   "execution": {
                     "type": "object",

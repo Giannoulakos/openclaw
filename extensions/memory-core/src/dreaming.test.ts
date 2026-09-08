@@ -23,6 +23,7 @@ import {
 } from "openclaw/plugin-sdk/system-event-runtime";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { registerShortTermPromotionDreaming } from "./dreaming.js";
+import { recordShortTermRecalls } from "./short-term-promotion.js";
 import { createMemoryCoreTestHarness } from "./test-helpers.js";
 
 // `runDreamingSweepPhases` is the only binding the dreaming trigger imports from this module.
@@ -1339,6 +1340,78 @@ describe("dreaming service reconciliation", () => {
     );
 
     await expect(fs.access(path.join(workspaceDir, "memory"))).rejects.toThrow();
+    await expect(fs.access(path.join(workspaceDir, "DREAMS.md"))).rejects.toThrow();
+  });
+
+  it("does not rerun model work or write narratives for a budget-deferred promotion", async () => {
+    const workspaceDir = await createTempWorkspace("openclaw-dreaming-budget-deferred-");
+    const date = new Date().toISOString().slice(0, 10);
+    const relativePath = `memory/${date}.md`;
+    await fs.mkdir(path.join(workspaceDir, "memory"), { recursive: true });
+    await fs.writeFile(
+      path.join(workspaceDir, relativePath),
+      "Keep the Tuesday deployment window in durable memory.\n",
+      "utf-8",
+    );
+    for (const query of ["deployment window", "Tuesday deploy", "release schedule"]) {
+      await recordShortTermRecalls({
+        workspaceDir,
+        query,
+        results: [
+          {
+            path: relativePath,
+            startLine: 1,
+            endLine: 1,
+            score: 0.95,
+            snippet: "Keep the Tuesday deployment window in durable memory.",
+            source: "memory",
+          },
+        ],
+      });
+    }
+    await fs.writeFile(
+      path.join(workspaceDir, "MEMORY.md"),
+      `# Long-Term Memory\n\n${"u".repeat(180)}\n`,
+      "utf-8",
+    );
+    const { api, harness } = createDreamingTestContext({
+      config: createDreamingConfig(
+        {
+          enabled: true,
+          limit: 5,
+          phases: { light: { enabled: false }, rem: { enabled: false } },
+        },
+        {
+          agents: {
+            defaults: { workspace: workspaceDir, bootstrapMaxChars: 200 },
+            list: [{ id: "main", default: true, workspace: workspaceDir }],
+          },
+        },
+      ),
+    });
+    const complete = vi.fn(async () => ({ text: "unused" }));
+    const unexpectedSubagentCall = async (): Promise<never> => {
+      throw new Error("unexpected subagent method");
+    };
+    api.runtime.subagent = {
+      complete,
+      run: unexpectedSubagentCall,
+      waitForRun: unexpectedSubagentCall,
+      getSessionMessages: unexpectedSubagentCall,
+      deleteSession: unexpectedSubagentCall,
+    };
+    registerShortTermPromotionDreamingForTest(api);
+    await triggerDreamingServiceStart(api, { config: api.config, getCron: () => harness.cron });
+
+    const beforeAgentReply = getBeforeAgentReplyHandler(api.on);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await beforeAgentReply(
+        { cleanedBody: constants.DREAMING_SYSTEM_EVENT_TEXT },
+        { trigger: "cron", agentId: "main", workspaceDir },
+      );
+    }
+
+    expect(complete).not.toHaveBeenCalled();
     await expect(fs.access(path.join(workspaceDir, "DREAMS.md"))).rejects.toThrow();
   });
 });

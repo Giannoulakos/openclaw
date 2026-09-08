@@ -2921,6 +2921,7 @@ describe("short-term promotion", () => {
       return await applyAllCandidates(workspaceDir, await rankAllCandidates(workspaceDir), {
         nowMs,
         memoryFileMaxChars: 1_400,
+        maxPriorEntryLossFraction: 1,
       });
     }
 
@@ -3052,6 +3053,94 @@ describe("short-term promotion", () => {
         expect((await fs.stat(workspaceDir)).mode & 0o7777).toBe(0o750);
         expect((await fs.stat(memoryPath)).mode & 0o7777).toBe(0o640);
       }
+    });
+
+    it("defers promotion when preserved content leaves no room in the file budget", async (workspaceDir) => {
+      await writeDailyMemoryNote(workspaceDir, "2026-04-29", [
+        "Keep the Tuesday deployment window in durable memory.",
+      ]);
+      await recordMemoryRecalls(
+        workspaceDir,
+        "deployment window",
+        [
+          memoryRecallResult(
+            "memory/2026-04-29.md",
+            1,
+            1,
+            0.95,
+            "Keep the Tuesday deployment window in durable memory.",
+          ),
+        ],
+        { nowMs: Date.parse("2026-04-29T10:00:00.000Z") },
+      );
+      const ranked = await rankAllCandidates(workspaceDir);
+      const memoryPath = path.join(workspaceDir, "MEMORY.md");
+      const oversizedBase = `# Long-Term Memory\n\n${"u".repeat(8_800)}\n`;
+      await fs.writeFile(memoryPath, oversizedBase, "utf-8");
+      const consolidate = vi.fn(async () => ({ text: "unused" }));
+
+      const deferred = await applyAllCandidates(workspaceDir, ranked, {
+        agentId: "main",
+        memoryFileMaxChars: 9_000,
+        nowMs: Date.parse("2026-04-29T10:00:00.000Z"),
+        consolidation: {
+          subagent: { complete: consolidate },
+          logger: { info: vi.fn(), warn: vi.fn() },
+        },
+      });
+
+      expect(deferred).toMatchObject({ applied: 0, appended: 0, compactedSections: 0 });
+      expect(deferred.rejectedCandidates).toEqual([
+        expect.objectContaining({ reason: expect.stringContaining("MEMORY.md budget exceeded") }),
+      ]);
+      expect(consolidate).not.toHaveBeenCalled();
+      await expect(fs.readFile(memoryPath, "utf-8")).resolves.toBe(oversizedBase);
+
+      await fs.writeFile(memoryPath, "# Long-Term Memory\n\n", "utf-8");
+      const retried = await applyAllCandidates(workspaceDir, ranked, {
+        memoryFileMaxChars: 9_000,
+        nowMs: Date.parse("2026-04-29T10:05:00.000Z"),
+      });
+      expect(retried.applied).toBe(1);
+      expect((await fs.readFile(memoryPath, "utf-8")).length).toBeLessThanOrEqual(9_000);
+    });
+
+    it("leaves prior promotions intact when fitting would exceed the loss limit", async (workspaceDir) => {
+      await writeDailyMemoryNote(workspaceDir, "2026-04-29", [
+        "Keep the Tuesday deployment window in durable memory.",
+      ]);
+      await recordMemoryRecalls(
+        workspaceDir,
+        "deployment window",
+        [
+          memoryRecallResult(
+            "memory/2026-04-29.md",
+            1,
+            1,
+            0.95,
+            "Keep the Tuesday deployment window in durable memory.",
+          ),
+        ],
+        { nowMs: Date.parse("2026-04-29T10:00:00.000Z") },
+      );
+      const memoryPath = path.join(workspaceDir, "MEMORY.md");
+      const existing = ["2026-04-01", "2026-04-08", "2026-04-15", "2026-04-22"]
+        .map(
+          (date, index) =>
+            `## Promoted From Short-Term Memory (${date})\n<!-- openclaw-memory-promotion:legacy-${index} -->\n- ${"x".repeat(500)}`,
+        )
+        .join("\n");
+      await fs.writeFile(memoryPath, existing, "utf-8");
+
+      const result = await applyAllCandidates(workspaceDir, await rankAllCandidates(workspaceDir), {
+        memoryFileMaxChars: 1_600,
+        maxPriorEntryLossFraction: 0.25,
+        nowMs: Date.parse("2026-04-29T10:00:00.000Z"),
+      });
+
+      expect(result).toMatchObject({ applied: 0, compactedSections: 0 });
+      expect(result.rejectedCandidates[0]?.reason).toContain("MEMORY.md budget exceeded");
+      await expect(fs.readFile(memoryPath, "utf-8")).resolves.toBe(existing);
     });
   });
 
@@ -3188,6 +3277,7 @@ describe("short-term promotion", () => {
           try {
             const applied = await applyAllCandidates(workspaceAlias, secondRanked, {
               memoryFileMaxChars: 400,
+              maxPriorEntryLossFraction: 1,
             });
             expect(applied.applied).toBe(1);
             expect(await fs.readFile(targetPath, "utf-8")).toContain(secondSnippet);
