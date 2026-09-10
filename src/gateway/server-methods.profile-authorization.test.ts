@@ -85,8 +85,8 @@ describe("Gateway pending-profile authorization", () => {
           hasAvatar: false,
           updatedAt: source.updatedAt,
         };
-        const entered = createDeferredCore<void>();
-        const release = createDeferredCore<void>();
+        const entered = createDeferredCore();
+        const release = createDeferredCore();
         const broadcast = vi.fn();
         const hasConnectedTalkNode = vi.fn(async () => {
           entered.resolve();
@@ -160,8 +160,8 @@ describe("Gateway pending-profile authorization", () => {
         hasAvatar: false,
         updatedAt: source.updatedAt,
       };
-      const entered = createDeferredCore<void>();
-      const release = createDeferredCore<void>();
+      const entered = createDeferredCore();
+      const release = createDeferredCore();
       const respond = vi.fn();
       const context = createDirectChatContext();
       const request = handleGatewayRequest({
@@ -224,8 +224,8 @@ describe("Gateway pending-profile authorization", () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
       const profile = ensureProfileForEmail("pending-binding@example.test");
       const client = createPendingProfileClient();
-      const entered = createDeferredCore<void>();
-      const release = createDeferredCore<void>();
+      const entered = createDeferredCore();
+      const release = createDeferredCore();
       client.authenticatedGitHubIdentitySync = vi.fn(async () => {
         entered.resolve();
         await release.promise;
@@ -270,8 +270,8 @@ describe("Gateway pending-profile authorization", () => {
           hasAvatar: false,
           updatedAt: source.updatedAt,
         };
-        const entered = createDeferredCore<void>();
-        const release = createDeferredCore<void>();
+        const entered = createDeferredCore();
+        const release = createDeferredCore();
         const handler = vi.fn<GatewayRequestHandler>(async ({ respond }) => {
           if (phase === "invocation") {
             entered.resolve();
@@ -329,7 +329,7 @@ describe("Gateway pending-profile authorization", () => {
         expect(client).not.toHaveProperty("invalidated", true);
         const current = await dispatchPendingProfileMethod({
           client,
-          handler: ({ respond }) => respond(true, { ok: true }),
+          handler: ({ respond: respondCurrent }) => respondCurrent(true, { ok: true }),
           method: "status",
           expectedProfileId: target.id,
         });

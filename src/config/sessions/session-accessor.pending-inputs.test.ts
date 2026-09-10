@@ -79,6 +79,16 @@ describe("accepted input custody", () => {
   };
   const promote = (receipt: SessionPendingInputReceipt) =>
     receipt.run(() => appendTranscriptMessage(scope(), { message: receipt.message }));
+  const createRelocation =
+    (receipt: SessionPendingInputReceipt) => (sourceInputId: string, eventId: string) =>
+      withSessionPendingInputRelocation(sourceInputId, receipt.message, () =>
+        appendTranscriptMessageSync(scope(), {
+          eventId,
+          idempotencyLookup: "caller-checked",
+          message: receipt.message,
+          parentId: null,
+        }),
+      );
 
   beforeEach(async () => {
     await upsertSessionEntryCore(scope(), { sessionId, updatedAt: 1 });
@@ -238,15 +248,7 @@ describe("accepted input custody", () => {
   it("moves transcript custody only after an authorized relocation commits", async () => {
     const receipt = await stage("relocation");
     await promote(receipt);
-    const appendCopy = (sourceInputId: string, eventId: string) =>
-      withSessionPendingInputRelocation(sourceInputId, receipt.message, () =>
-        appendTranscriptMessageSync(scope(), {
-          eventId,
-          idempotencyLookup: "caller-checked",
-          message: receipt.message,
-          parentId: null,
-        }),
-      );
+    const appendCopy = createRelocation(receipt);
 
     expect(
       receipt.run(() =>
@@ -291,15 +293,7 @@ describe("accepted input custody", () => {
   it("publishes committed relocation before fallible post-commit observers", async () => {
     const receipt = await stage("relocation-observer");
     await promote(receipt);
-    const appendCopy = (sourceInputId: string, eventId: string) =>
-      withSessionPendingInputRelocation(sourceInputId, receipt.message, () =>
-        appendTranscriptMessageSync(scope(), {
-          eventId,
-          idempotencyLookup: "caller-checked",
-          message: receipt.message,
-          parentId: null,
-        }),
-      );
+    const appendCopy = createRelocation(receipt);
 
     expect(() =>
       runOpenClawAgentWriteTransaction(
@@ -325,15 +319,7 @@ describe("accepted input custody", () => {
     const receipt = await stage("relocation-savepoints");
     await promote(receipt);
     const databaseOptions = toDatabaseOptions(resolveSqliteScope(scope()));
-    const appendCopy = (sourceInputId: string, eventId: string) =>
-      withSessionPendingInputRelocation(sourceInputId, receipt.message, () =>
-        appendTranscriptMessageSync(scope(), {
-          eventId,
-          idempotencyLookup: "caller-checked",
-          message: receipt.message,
-          parentId: null,
-        }),
-      );
+    const appendCopy = createRelocation(receipt);
 
     expect(() =>
       runOpenClawAgentWriteTransaction(() => {
@@ -361,12 +347,9 @@ describe("accepted input custody", () => {
       });
     }, databaseOptions);
 
-    expect((await loadTranscriptEvents(scope())).map(readEventId)).not.toContain(
-      "rolled-back-outer",
-    );
-    expect((await loadTranscriptEvents(scope())).map(readEventId)).not.toContain(
-      "rolled-back-savepoint",
-    );
+    for (const eventId of ["rolled-back-outer", "rolled-back-savepoint"]) {
+      expect((await loadTranscriptEvents(scope())).map(readEventId)).not.toContain(eventId);
+    }
     expect(() =>
       receipt.run(() => appendCopy("first-savepoint-copy", "stale-savepoint-source")),
     ).toThrow("does not match");
@@ -443,9 +426,8 @@ describe("accepted input custody", () => {
     gate.resolve();
     await held;
     expect(await queued).toMatchObject({ appended: true, messageId: second.inputId });
-    expect(listSessionPendingInputs(scope()).items.map((input) => input.id)).toEqual([
-      first.inputId,
-    ]);
+    const pendingIds = listSessionPendingInputs(scope()).items.map((input) => input.id);
+    expect(pendingIds).toEqual([first.inputId]);
   });
 
   it("commits one collected message and retains exact source receipts across rewrite and restart", async () => {

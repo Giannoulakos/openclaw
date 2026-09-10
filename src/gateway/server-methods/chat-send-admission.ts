@@ -12,6 +12,7 @@ import {
   isReplyRunAbortableForSignal,
   REPLY_RUN_IDLE_SETTLE_TIMEOUT_MS,
   replyRunRegistry,
+  type ReplyMessageInjectionTarget,
 } from "../../auto-reply/reply/reply-run-registry.js";
 import { resolveSessionWorkStartError } from "../../config/sessions.js";
 import { SESSION_ROUTING_CHANGED_ERROR_REASON } from "../../config/sessions/main-session.js";
@@ -118,7 +119,12 @@ export async function admitChatSend(params: {
   });
   const lifecycleGeneration = getAgentEventLifecycleGeneration();
   const pendingAttemptId = randomUUID();
-  const pendingExpiresAtMs = resolveChatRunExpiresAtMs({ now, timeoutMs });
+  const readPendingReservation = () =>
+    readPreRegisteredRun({
+      key: pendingChatSendKey,
+      entry: context.dedupe.get(pendingChatSendKey),
+      keyPrefix: PENDING_CHAT_SEND_DEDUPE_PREFIX,
+    });
   const goalRetry = inspectGoalChatSendRetry(params);
   if (goalRetry.kind !== "new") {
     if (goalRetry.kind === "replay") {
@@ -130,13 +136,7 @@ export async function admitChatSend(params: {
     return { ok: false as const };
   }
   // A plain chat retry must not replace a Goal reservation after yielding in recovery.
-  if (
-    readPreRegisteredRun({
-      key: pendingChatSendKey,
-      entry: context.dedupe.get(pendingChatSendKey),
-      keyPrefix: PENDING_CHAT_SEND_DEDUPE_PREFIX,
-    })?.payload.goalFingerprint
-  ) {
+  if (readPendingReservation()?.payload.goalFingerprint) {
     respond(
       false,
       undefined,
@@ -163,7 +163,7 @@ export async function admitChatSend(params: {
       ...(selectedAgent.agentId ? { agentId: selectedAgent.agentId } : {}),
       ownerConnId: normalizeOptionalChatText(client?.connId),
       ownerDeviceId: normalizeOptionalChatText(client?.connect?.device?.id),
-      expiresAtMs: pendingExpiresAtMs,
+      expiresAtMs: resolveChatRunExpiresAtMs({ now, timeoutMs }),
       turnKind,
       ...(request.goalOperation
         ? { goalFingerprint: request.goalOperation.requestFingerprint }
@@ -171,11 +171,7 @@ export async function admitChatSend(params: {
     },
   });
   const clearPendingChatSendReservation = () => {
-    const pending = readPreRegisteredRun({
-      key: pendingChatSendKey,
-      entry: context.dedupe.get(pendingChatSendKey),
-      keyPrefix: PENDING_CHAT_SEND_DEDUPE_PREFIX,
-    });
+    const pending = readPendingReservation();
     if (
       pending?.runId === clientRunId &&
       normalizeUnknownChatText(pending.payload.attemptId) === pendingAttemptId
@@ -190,9 +186,7 @@ export async function admitChatSend(params: {
   let initialSessionEntry: SessionEntry | undefined;
   let admittedSessionSettings: ReturnType<typeof captureAdmittedChatSendSessionSettings>;
   let assertInitialSkillSelection: (() => void) | undefined;
-  let messageInjectionTarget: ReturnType<
-    typeof replyRunRegistry.resolveCurrentMessageInjectionTarget
-  >;
+  let messageInjectionTarget: ReplyMessageInjectionTarget | undefined;
   let runInterruptTarget: ReturnType<typeof replyRunRegistry.resolveCurrentInterruptTarget>;
   let reservationSuperseded = false;
   let supersedingResult: DedupeEntry | undefined;
@@ -205,11 +199,7 @@ export async function admitChatSend(params: {
     if (context.chatRunState.hasAbortMarker(clientRunId)) {
       return;
     }
-    const pendingReservation = readPreRegisteredRun({
-      key: pendingChatSendKey,
-      entry: context.dedupe.get(pendingChatSendKey),
-      keyPrefix: PENDING_CHAT_SEND_DEDUPE_PREFIX,
-    });
+    const pendingReservation = readPendingReservation();
     if (
       pendingReservation &&
       normalizeUnknownChatText(pendingReservation.payload.attemptId) !== pendingAttemptId

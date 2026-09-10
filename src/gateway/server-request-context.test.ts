@@ -212,8 +212,9 @@ describe("createGatewayRequestContext", () => {
       const target = ensureProfileForEmail("event-target@example.test");
       const third = ensureProfileForEmail("event-third@example.test");
       const frames: Array<{ connId: string; event: string; recipientProfileId?: string }> = [];
-      const clients = new GatewayClientRegistry(
-        [source, target, third].map((profile, index) => ({
+      const clients = new GatewayClientRegistry();
+      for (const [index, profile] of [source, target, third].entries()) {
+        clients.add({
           ...makeGatewayClient({
             connId: `event-${index}`,
             clientId: GATEWAY_CLIENT_IDS.CONTROL_UI,
@@ -237,8 +238,8 @@ describe("createGatewayRequestContext", () => {
               done?.();
             },
           } as unknown as GatewayWsClient["socket"],
-        })),
-      );
+        });
+      }
       const peers = [...clients];
       const broadcaster = createGatewayBroadcaster({
         clients,
@@ -471,72 +472,49 @@ describe("createGatewayRequestContext", () => {
   });
 
   it("refreshes every live connection and presence row for a changed user profile", () => {
-    const first = {
+    const makeProfileClient = (
+      connId: string,
+      email: string,
+      profile: Partial<NonNullable<GatewayWsClient["authenticatedUserProfile"]>> = {},
+    ) => ({
       ...makeGatewayClient({
-        connId: "ada-one",
+        connId,
         clientId: GATEWAY_CLIENT_IDS.CONTROL_UI,
       }),
-      authenticatedUserId: "ada@example.test",
+      authenticatedUserId: email,
       authenticatedUserProfile: {
         profileId: "profile-ada",
         displayName: "Ada",
         avatarRevision: "avatar-old-png",
         hasAvatar: true,
         updatedAt: 1,
+        ...profile,
       },
-      presenceKey: "profile-refresh-ada-one",
-    };
-    const second = {
-      ...makeGatewayClient({
-        connId: "ada-two",
-        clientId: GATEWAY_CLIENT_IDS.CONTROL_UI,
-      }),
-      authenticatedUserId: "ada@work.test",
-      authenticatedUserProfile: {
-        profileId: "profile-ada",
-        displayName: "Ada",
-        avatarRevision: "avatar-old-png",
-        hasAvatar: true,
-        updatedAt: 1,
-      },
-      presenceKey: "profile-refresh-ada-two",
-    };
-    const unrelated = {
-      ...makeGatewayClient({
-        connId: "grace",
-        clientId: GATEWAY_CLIENT_IDS.CONTROL_UI,
-      }),
-      authenticatedUserId: "grace@example.test",
-      authenticatedUserProfile: {
-        profileId: "profile-grace",
-        displayName: "Grace",
-        avatarRevision: "1",
-        hasAvatar: false,
-        updatedAt: 1,
-      },
-      presenceKey: "profile-refresh-grace",
-    };
-    const clients = new Set([first, second, unrelated]) as never;
-    const params = makeContextParams({ clients });
+      presenceKey: `profile-refresh-${connId}`,
+    });
+    const first = makeProfileClient("ada-one", "ada@example.test");
+    const second = makeProfileClient("ada-two", "ada@work.test");
+    const unrelated = makeProfileClient("grace", "grace@example.test", {
+      profileId: "profile-grace",
+      displayName: "Grace",
+      avatarRevision: "1",
+      hasAvatar: false,
+    });
+    const params = makeContextParams({ clients: new Set([first, second, unrelated]) as never });
     const context = createGatewayRequestContext(params);
     const capturedFirstProfile = first.authenticatedUserProfile;
     const readCapturedDisplayName = () => capturedFirstProfile.displayName;
 
-    context.refreshConnectedUserProfile?.({
-      id: "profile-ada",
-      displayName: "Augusta Ada",
-      avatarRevision: "avatar-new-png",
-      hasAvatar: true,
-      updatedAt: 2,
-    });
-
-    context.refreshConnectedUserProfile?.({
-      id: "profile-ada",
-      displayName: "Augusta Ada",
-      avatarRevision: "avatar-newer-png",
-      hasAvatar: true,
-      updatedAt: 2,
-    });
+    const revisions = ["avatar-new-png", "avatar-newer-png"];
+    for (const avatarRevision of revisions) {
+      context.refreshConnectedUserProfile?.({
+        id: "profile-ada",
+        displayName: "Augusta Ada",
+        avatarRevision,
+        hasAvatar: true,
+        updatedAt: 2,
+      });
+    }
 
     expect(first.authenticatedUserProfile).toEqual({
       profileId: "profile-ada",
@@ -549,66 +527,28 @@ describe("createGatewayRequestContext", () => {
     expect(readCapturedDisplayName()).toBe("Augusta Ada");
     expect(second.authenticatedUserProfile).toEqual(first.authenticatedUserProfile);
     expect(unrelated.authenticatedUserProfile.displayName).toBe("Grace");
-    expect(params.runtime.broadcast).toHaveBeenNthCalledWith(
-      1,
-      "presence",
-      {
-        presence: expect.arrayContaining([
-          expect.objectContaining({
-            user: {
-              id: "profile-ada",
-              identity: { type: "profile", id: "profile-ada" },
-              email: "ada@example.test",
-              name: "Augusta Ada",
-              avatarUrl: "/api/users/profile-ada/avatar?v=avatar-new-png",
-            },
-          }),
-          expect.objectContaining({
-            user: {
-              id: "profile-ada",
-              identity: { type: "profile", id: "profile-ada" },
-              email: "ada@work.test",
-              name: "Augusta Ada",
-              avatarUrl: "/api/users/profile-ada/avatar?v=avatar-new-png",
-            },
-          }),
-        ]),
-      },
-      {
-        dropIfSlow: true,
-        stateVersion: { presence: 1, health: 1 },
-      },
-    );
-    expect(params.runtime.broadcast).toHaveBeenNthCalledWith(
-      2,
-      "presence",
-      {
-        presence: expect.arrayContaining([
-          expect.objectContaining({
-            user: {
-              id: "profile-ada",
-              identity: { type: "profile", id: "profile-ada" },
-              email: "ada@example.test",
-              name: "Augusta Ada",
-              avatarUrl: "/api/users/profile-ada/avatar?v=avatar-newer-png",
-            },
-          }),
-          expect.objectContaining({
-            user: {
-              id: "profile-ada",
-              identity: { type: "profile", id: "profile-ada" },
-              email: "ada@work.test",
-              name: "Augusta Ada",
-              avatarUrl: "/api/users/profile-ada/avatar?v=avatar-newer-png",
-            },
-          }),
-        ]),
-      },
-      {
-        dropIfSlow: true,
-        stateVersion: { presence: 1, health: 1 },
-      },
-    );
+    for (const [index, avatarRevision] of revisions.entries()) {
+      expect(params.runtime.broadcast).toHaveBeenNthCalledWith(
+        index + 1,
+        "presence",
+        {
+          presence: expect.arrayContaining(
+            ["ada@example.test", "ada@work.test"].map((email) =>
+              expect.objectContaining({
+                user: {
+                  id: "profile-ada",
+                  identity: { type: "profile", id: "profile-ada" },
+                  email,
+                  name: "Augusta Ada",
+                  avatarUrl: `/api/users/profile-ada/avatar?v=${avatarRevision}`,
+                },
+              }),
+            ),
+          ),
+        },
+        { dropIfSlow: true, stateVersion: { presence: 1, health: 1 } },
+      );
+    }
   });
 
   it("canonicalizes a connected profile after its durable identity is merged", async () => {
