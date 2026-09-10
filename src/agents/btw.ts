@@ -1089,6 +1089,9 @@ export async function runBtwSideQuestion(
         const host = createAgentHarnessHostCapabilities({
           attempt: {
             ...hostAttempt,
+            // A side question owns an independent admitted turn, not the main
+            // conversation's terminal writer authority.
+            sessionTarget: undefined,
             admittedRunContext,
             config: params.cfg,
             agentId: sessionAgentId,
@@ -1145,7 +1148,7 @@ export async function runBtwSideQuestion(
         };
         let result: Awaited<ReturnType<NonNullable<AgentHarness["runSideQuestion"]>>>;
         try {
-          result = await selectedHarness.runSideQuestion(sideParams);
+          result = await host.runWithScope(() => selectedHarness.runSideQuestion!(sideParams));
         } finally {
           host.close();
         }

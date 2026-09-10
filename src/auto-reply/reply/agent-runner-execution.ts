@@ -13,6 +13,10 @@ import type {
 import { peekSessionMcpRuntime } from "../../agents/agent-bundle-mcp-manager-api.js";
 import { resolveBootstrapWarningSignaturesSeen } from "../../agents/bootstrap-budget.js";
 import {
+  copyCurrentTurnReplyCompletion,
+  readCurrentTurnReplyCompletion,
+} from "../../agents/current-turn-reply-completion.js";
+import {
   classifyFailoverReason,
   isContextOverflowError,
 } from "../../agents/embedded-agent-helpers.js";
@@ -369,13 +373,13 @@ async function executeAgentTurnInternalLoop(
         return cycle;
       }
       if (cycle.kind === "final") {
-        return {
+        return copyCurrentTurnReplyCompletion(cycle, {
           ...cycle,
           resolved: {
             provider: fallbackCycleState.attemptedRuntimeProvider,
             model: fallbackCycleState.attemptedRuntimeModel,
           },
-        };
+        });
       }
       runResult = cycle.runResult;
       fallbackProvider = cycle.fallbackProvider;
@@ -385,6 +389,9 @@ async function executeAgentTurnInternalLoop(
       terminalRunFailed = cycle.terminalRunFailed;
       break;
     } catch (err) {
+      if (readCurrentTurnReplyCompletion(err)) {
+        throw err;
+      }
       if (err instanceof LiveSessionModelSwitchError) {
         liveModelSwitchRetries += 1;
       }
@@ -436,14 +443,14 @@ async function executeAgentTurnInternalLoop(
     const errorMsg = finalEmbeddedError.message ?? "";
     if (isContextOverflowError(errorMsg)) {
       params.replyOperation?.fail("run_failed", finalEmbeddedError);
-      return {
+      return copyCurrentTurnReplyCompletion(runResult.meta?.agentMeta?.terminalReceipt, {
         kind: "final",
         resolved: { provider: fallbackProvider, model: fallbackModel },
         payload: markAgentRunFailureReplyPayload({
           text: "⚠️ Context overflow — this conversation is too large for the model. Use /new to start a fresh session.",
         }),
         postCompactionModelFailure: fallbackCycleState.postCompactionModelAttempted || undefined,
-      };
+      });
     }
   }
 
@@ -505,7 +512,7 @@ async function executeAgentTurnInternalLoop(
       })
     : undefined;
 
-  return {
+  return copyCurrentTurnReplyCompletion(runResult.meta?.agentMeta?.terminalReceipt, {
     kind: "completed",
     maintenanceAuthProfile: fallbackCycleState.maintenanceAuthProfile,
     compactionRequestBudget: fallbackCycleState.compactionRequestBudget,
@@ -524,7 +531,7 @@ async function executeAgentTurnInternalLoop(
     ...(terminalRunFailed && fallbackCycleState.postCompactionModelAttempted
       ? { postCompactionModelFailure: true as const }
       : {}),
-  };
+  });
 }
 
 async function executeAgentTurnInternal(
@@ -642,14 +649,16 @@ async function executeAgentTurnOutcome(params: AgentTurnParams): Promise<AgentTu
       }
     });
     if (internal.kind === "aborted") {
-      return { runId, outcome: { ...internal, ...completedCompaction() } };
+      const outcome = { ...internal, ...completedCompaction() };
+      return copyCurrentTurnReplyCompletion(internal, { runId, outcome });
     }
     const abortReason = resolveReplyOperationAbortReason(executionParams.replyOperation);
     if (abortReason) {
-      return { runId, outcome: { kind: "aborted", reason: abortReason, ...completedCompaction() } };
+      const outcome = { kind: "aborted" as const, reason: abortReason, ...completedCompaction() };
+      return copyCurrentTurnReplyCompletion(internal, { runId, outcome });
     }
     if (internal.kind === "final") {
-      return {
+      return copyCurrentTurnReplyCompletion(internal, {
         runId,
         outcome: {
           kind: "rejected",
@@ -660,7 +669,7 @@ async function executeAgentTurnOutcome(params: AgentTurnParams): Promise<AgentTu
             : {}),
           ...completedCompaction(),
         },
-      };
+      });
     }
     const provider =
       internal.fallbackProvider ??
@@ -702,7 +711,10 @@ async function executeAgentTurnOutcome(params: AgentTurnParams): Promise<AgentTu
   } catch (error) {
     const abortReason = resolveReplyOperationAbortReason(executionParams.replyOperation, error);
     if (abortReason) {
-      return { runId, outcome: { kind: "aborted", reason: abortReason, ...completedCompaction() } };
+      return copyCurrentTurnReplyCompletion(error, {
+        runId,
+        outcome: { kind: "aborted", reason: abortReason, ...completedCompaction() },
+      });
     }
     throw error;
   }

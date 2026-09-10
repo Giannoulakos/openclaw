@@ -652,6 +652,8 @@ export async function runReplyAgent(
     replyRunState.recordReplyOperationAgentTurn(
       followupRun.replyOperationRunStates,
       replyOperation,
+      undefined,
+      error,
     );
     return await handleReplyAgentRunError(error, {
       cfg,
