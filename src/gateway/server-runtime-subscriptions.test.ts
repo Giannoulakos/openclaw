@@ -211,6 +211,7 @@ function createParams(): SubscriptionParams {
     chatAbortControllers: new Map(),
     restartRecoveryCandidates: new Map(),
     terminalSessions: { closeTaskSessions: vi.fn() },
+    refreshConnectedUserProfiles: vi.fn(),
   };
 }
 

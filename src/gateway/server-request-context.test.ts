@@ -9,6 +9,7 @@ import {
 } from "../../packages/gateway-protocol/src/client-info.js";
 import { listSystemPresence } from "../infra/system-presence.js";
 import { trackAsyncWork } from "../shared/async-work-scope.js";
+import * as userProfiles from "../state/user-profiles.js";
 import {
   ensureProfileForEmail,
   getUserProfileDisplay,
@@ -16,10 +17,18 @@ import {
   resolveUserProfileId,
 } from "../state/user-profiles.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
-import { createChatRunState } from "./server-chat-state.js";
+import { prepareGatewayRecipientProfile } from "./expected-profile.js";
+import { createGatewayBroadcaster } from "./server-broadcast.js";
+import {
+  createChatRunState,
+  createSessionEventSubscriberRegistry,
+  createSessionMessageSubscriberRegistry,
+} from "./server-chat-state.js";
 import type { GatewayServerLiveState } from "./server-live-state.js";
 import type { GatewayRequestContext } from "./server-methods/types.js";
 import { createGatewayRequestContext } from "./server-request-context.js";
+import { startGatewayEventSubscriptions } from "./server-runtime-subscriptions.js";
+import { GatewayClientRegistry } from "./server/client-registry.js";
 import type { GatewayWsClient } from "./server/ws-types.js";
 
 type GatewayRequestContextParams = Parameters<typeof createGatewayRequestContext>[0];
@@ -197,6 +206,108 @@ function makeGatewayClient(params: {
 }
 
 describe("createGatewayRequestContext", () => {
+  it("prepares every recipient before the real merge's first notification and contains resolution failure", async () => {
+    await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      const source = ensureProfileForEmail("event-source@example.test");
+      const target = ensureProfileForEmail("event-target@example.test");
+      const third = ensureProfileForEmail("event-third@example.test");
+      const frames: Array<{ connId: string; event: string; recipientProfileId?: string }> = [];
+      const clients = new GatewayClientRegistry(
+        [source, target, third].map((profile, index) => ({
+          ...makeGatewayClient({
+            connId: `event-${index}`,
+            clientId: GATEWAY_CLIENT_IDS.CONTROL_UI,
+            scopes: ["operator.admin"],
+          }),
+          usesSharedGatewayAuth: false,
+          presenceKey: `event-${index}`,
+          authenticatedUserProfile: {
+            profileId: profile.id,
+            displayName: null,
+            avatarRevision: "1",
+            hasAvatar: false,
+            updatedAt: profile.updatedAt,
+          },
+          socket: {
+            readyState: 1,
+            bufferedAmount: 0,
+            close: vi.fn(),
+            send: (wire: string, done?: () => void) => {
+              frames.push({ connId: `event-${index}`, ...JSON.parse(wire) });
+              done?.();
+            },
+          } as unknown as GatewayWsClient["socket"],
+        })),
+      );
+      const peers = [...clients];
+      const broadcaster = createGatewayBroadcaster({
+        clients,
+        preparePresenceProjection: (presence) => () => presence,
+      });
+      const params = makeContextParams({ clients, ...broadcaster });
+      const context = createGatewayRequestContext(params);
+      for (const peer of peers) {
+        prepareGatewayRecipientProfile(peer);
+      }
+      const subscribers = createSessionEventSubscriberRegistry();
+      for (const peer of peers) {
+        subscribers.subscribe(peer.connId);
+      }
+      const chatRunState = createChatRunState();
+      const subscriptions = startGatewayEventSubscriptions({
+        ...broadcaster,
+        log: params.log,
+        nodeSendToSession: vi.fn(),
+        agentRunSeq: new Map(),
+        chatRunState,
+        toolEventRecipients: chatRunState.toolEventRecipients,
+        sessionEventSubscribers: subscribers,
+        sessionMessageSubscribers: createSessionMessageSubscriberRegistry(),
+        chatAbortControllers: new Map(),
+        restartRecoveryCandidates: new Map(),
+        terminalSessions: { closeTaskSessions: vi.fn() },
+        refreshConnectedUserProfiles: () => context.refreshConnectedUserProfile?.(),
+      });
+      try {
+        linkEmail("event-source@example.test", target.id);
+        for (const [index, profileId] of [target.id, target.id, third.id].entries()) {
+          const first = frames.find((frame) => frame.connId === `event-${index}`);
+          expect(first).toMatchObject({ recipientProfileId: profileId });
+          expect(
+            frames
+              .filter((frame) => frame.connId === `event-${index}`)
+              .every((frame) => frame.recipientProfileId === profileId),
+          ).toBe(true);
+        }
+        expect(frames.some((frame) => frame.event === "sessions.changed")).toBe(true);
+        const authenticated = peers.map((peer) => peer.authenticatedUserProfile);
+        const resolve = vi
+          .spyOn(userProfiles, "resolveUserProfileId")
+          .mockImplementationOnce(() => {
+            throw new Error("fixture storage unavailable");
+          });
+        try {
+          context.refreshConnectedUserProfile?.();
+          expect(peers[0]!.preparedRecipientProfileId).toBeUndefined();
+          expect(peers[1]!.preparedRecipientProfileId).toBe(target.id);
+          expect(peers[2]!.preparedRecipientProfileId).toBe(third.id);
+          peers.forEach((peer, index) => {
+            expect(peer.authenticatedUserProfile).toBe(authenticated[index]);
+            expect(peer.invalidated).not.toBe(true);
+          });
+        } finally {
+          resolve.mockRestore();
+        }
+      } finally {
+        subscriptions.lifecycleUnsub();
+        subscriptions.heartbeatUnsub();
+        subscriptions.transcriptUnsub();
+        await subscriptions.agentUnsub();
+        await subscriptions.taskUnsub();
+      }
+    });
+  });
+
   it("reuses the canonical connection liveness predicate", () => {
     const isConnectionActive = vi.fn(() => true);
     const params = makeContextParams();

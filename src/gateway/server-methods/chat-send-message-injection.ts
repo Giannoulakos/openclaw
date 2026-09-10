@@ -44,6 +44,7 @@ export function createChatSendMessageInjectionStarter(params: {
   userTurnTranscriptRecorder: NonNullable<
     ReplyBackendQueueMessageOptions["userTurnTranscriptRecorder"]
   >;
+  assertCurrent?: () => void;
 }) {
   const { p, rawMessage, supportsTaskSuggestions } = params.request;
   const { cfg, entry } = params.session;
@@ -52,6 +53,7 @@ export function createChatSendMessageInjectionStarter(params: {
     if (!params.target || isInternalTextSlashCommandTurn) {
       return undefined;
     }
+    params.assertCurrent?.();
     const { debounceMs } = resolveQueueSettings({
       cfg,
       channel: ctx.Provider,
@@ -95,6 +97,7 @@ export function createChatSendMessageInjectionStarter(params: {
         ? buildChatSendReplyInjectionText({ body: text, cfg, ctx, sessionEntry: entry })
         : text,
       {
+        assertCurrent: params.assertCurrent,
         steeringMode: "all",
         isInboundUserMessage: true,
         toolAuthorityOverlay: resolveInboundReplyToolAuthorityOverlay({
@@ -134,6 +137,10 @@ export async function settleChatSendPreAckMessageInjection(params: {
 }): Promise<PreAckMessageInjectionResult> {
   if (!params.attempt || (await params.attempt.acceptance)) {
     return { status: "continue", attempt: params.attempt };
+  }
+  const outcome = await params.attempt.outcome;
+  if (outcome.status === "failed") {
+    throw outcome.error;
   }
   if (params.isAborted()) {
     params.onAborted();

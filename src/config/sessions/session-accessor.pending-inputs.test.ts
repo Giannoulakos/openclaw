@@ -39,6 +39,7 @@ import {
   runExclusiveSqliteSessionWrite,
   toDatabaseOptions,
 } from "./session-accessor.sqlite-scope.js";
+import { SessionPendingInputCustodyError } from "./session-pending-input-custody-error.js";
 import { waitForSessionTranscriptProjection } from "./session-transcript-reconcile.js";
 import { useTempSessionsFixture } from "./test-helpers.js";
 
@@ -556,13 +557,13 @@ describe("accepted input custody", () => {
     const aggregate = bindSessionPendingInputSources([first, second], message("fence-c"))!;
     receipts.push(aggregate);
     expect(bindSessionPendingInputSources([{ ...first }], message("forged-c"))).toBeUndefined();
-    await expect(
-      aggregate.run(async () => {
-        await Promise.resolve();
-        first.finish("cancelled");
-        return appendTranscriptMessage(scope(), { message: aggregate.message });
-      }),
-    ).rejects.toThrow("custody ended");
+    const promotion = aggregate.run(async () => {
+      await Promise.resolve();
+      first.finish("cancelled");
+      return appendTranscriptMessage(scope(), { message: aggregate.message });
+    });
+    await expect(promotion).rejects.toThrow("custody ended");
+    await expect(promotion).rejects.toBeInstanceOf(SessionPendingInputCustodyError);
     expect(await loadTranscriptEvents(scope())).toEqual([]);
     expect(listSessionPendingInputs(scope()).items.map((input) => input.state)).toEqual([
       "cancelled",
@@ -680,14 +681,31 @@ describe("accepted input custody", () => {
     });
   });
 
-  it("retires current-process custody on lifecycle rotation and never replays it after reopening", async () => {
-    const receipt = await stage("restart");
-    rotateAgentEventLifecycleGeneration();
-    closeOpenClawAgentDatabasesForTest();
-    expect(readSessionPendingInput(scope(), receipt.inputId)?.state).toBe("interrupted");
-    expect(await loadTranscriptEvents(scope())).toEqual([]);
-    expect(() => promote(receipt)).toThrow("ownership ended");
-  });
+  it.each(["receipt-entry", "persistence-only"] as const)(
+    "retires current-process custody on lifecycle rotation and fences %s after reopening",
+    async (entry) => {
+      const receipt = await stage("restart");
+      rotateAgentEventLifecycleGeneration();
+      closeOpenClawAgentDatabasesForTest();
+      const retained = readSessionPendingInput(scope(), receipt.inputId);
+      expect(retained?.state).toBe("interrupted");
+      expect(await loadTranscriptEvents(scope())).toEqual([]);
+      if (entry === "receipt-entry") {
+        const execute = vi.fn();
+        expect(() => receipt.run(execute)).toThrow(SessionPendingInputCustodyError);
+        expect(execute).not.toHaveBeenCalled();
+        expect(() => promote(receipt)).toThrow("ownership ended");
+      } else {
+        const promotion = withSessionPendingInputPersistence(receipt, () =>
+          appendTranscriptMessage(scope(), { message: receipt.message }),
+        );
+        await expect(promotion).rejects.toBeInstanceOf(SessionPendingInputCustodyError);
+        await expect(promotion).rejects.toThrow("outside its admitted turn");
+      }
+      expect(await loadTranscriptEvents(scope())).toEqual([]);
+      expect(readSessionPendingInput(scope(), receipt.inputId)).toEqual(retained);
+    },
+  );
 
   it("allows terminal mirroring to read a promoted user after cancellation without a new append", async () => {
     const receipt = await stage("terminal-mirror");

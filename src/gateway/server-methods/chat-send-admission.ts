@@ -31,6 +31,7 @@ import {
   registerChatAbortController,
   resolveChatRunExpiresAtMs,
 } from "../chat-abort.js";
+import { ExpectedProfileMismatchError } from "../expected-profile.js";
 import { PENDING_CHAT_SEND_DEDUPE_PREFIX, type DedupeEntry } from "../server-shared.js";
 import { loadSessionEntry } from "../session-utils.js";
 import { formatForLog } from "../ws-log.js";
@@ -68,7 +69,9 @@ export async function admitChatSend(params: {
   context: GatewayRequestHandlerOptions["context"];
   client: GatewayRequestHandlerOptions["client"];
   onAdmissionOwned?: () => Promise<boolean>;
+  assertCurrent?: () => void;
 }) {
+  params.assertCurrent?.();
   const { request, session, respond, context, client } = params;
   const { p, explicitOrigin, normalizedAttachments, turnKind } = request;
   const {
@@ -146,6 +149,7 @@ export async function admitChatSend(params: {
   }
   // Keep the run abortable while lifecycle mutation owns the session. Admission
   // must reject an expired/missing reservation instead of reviving evicted work.
+  params.assertCurrent?.();
   context.dedupe.set(pendingChatSendKey, {
     ts: now,
     ok: true,
@@ -193,6 +197,7 @@ export async function admitChatSend(params: {
   let reservationSuperseded = false;
   let supersedingResult: DedupeEntry | undefined;
   const assertChatWorkAdmissionAllowed = (commitOutcome: boolean) => {
+    params.assertCurrent?.();
     const retainedRequestConflict = resolveChatSendRequestConflict(params);
     if (retainedRequestConflict) {
       throw new Error(retainedRequestConflict.message);
@@ -421,8 +426,14 @@ export async function admitChatSend(params: {
         }
       },
     });
+    params.assertCurrent?.();
   } catch (err) {
     clearPendingChatSendReservation();
+    admittedRunAbort?.cleanup();
+    gatewayWorkAdmission?.release();
+    if (err instanceof ExpectedProfileMismatchError) {
+      throw err;
+    }
     const requestConflict = resolveChatSendRequestConflict(params);
     if (requestConflict) {
       respond(false, undefined, requestConflict);
@@ -544,6 +555,7 @@ export async function admitChatSend(params: {
       // The fallback runs inside the new admission so the lifecycle owner excludes itself.
       // A captured reply operation never falls through to this identity-scoped path.
       const fallback = await gatewayWorkAdmission.run(async () => {
+        params.assertCurrent?.();
         if (!isCompetingSessionWorkAdmissionActive(storePath, identities)) {
           return { interrupted: false, settled: true };
         }
@@ -559,6 +571,7 @@ export async function admitChatSend(params: {
       interruptedActiveRun = fallback.interrupted;
       interruptionSettled = fallback.settled;
     }
+    params.assertCurrent?.();
     if (!interruptionSettled) {
       cleanupPreDispatchAdmission();
       respond(
@@ -578,6 +591,7 @@ export async function admitChatSend(params: {
       cleanupPreDispatchAdmission();
       return { ok: false as const };
     }
+    params.assertCurrent?.();
   } catch (error) {
     cleanupPreDispatchAdmission();
     throw error;
