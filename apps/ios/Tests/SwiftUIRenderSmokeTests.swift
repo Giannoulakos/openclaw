@@ -220,7 +220,19 @@ struct SwiftUIRenderSmokeTests {
 
     @Test(arguments: ["new-chat", "send", "reopen"])
     @MainActor func `native chat owns routing across activation and explicit reopen`(action: String) async throws {
-        try await withUserDefaults(["talk.enabled": false, "talk.background.enabled": false]) {
+        try await Self.nativeChatFixture(action: action)
+    }
+
+    @Test(arguments: ["pending", "reserved"])
+    @MainActor func `native compose preserves dictation`(capturePhase: String) async throws {
+        try await Self.nativeChatFixture(action: "dictation-\(capturePhase)")
+    }
+
+    @MainActor private static func nativeChatFixture(action: String) async throws {
+        try await withUserDefaults([
+            "talk.enabled": false, "talk.background.enabled": false, VoiceWakePreferences.enabledKey: false,
+        ]) {
+            let isDictation = action == "dictation-pending" || action == "dictation-reserved"
             let session = OpenClawNativeSessionRef(
                 owner: .init(gatewayID: "chat-activation-\(UUID().uuidString)", profileID: "profile-b"),
                 agentID: "main",
@@ -304,7 +316,7 @@ struct SwiftUIRenderSmokeTests {
                     }
                 })
             defer { fixture.stop() }
-            let appModel = NodeAppModel(audioAdmissionInitiallyAllowed: false)
+            let appModel = NodeAppModel(audioAdmissionInitiallyAllowed: isDictation)
             let gateway = appModel.operatorSession
             let gatewayController = GatewayConnectionController(appModel: appModel, startDiscovery: false)
             let router = NativeActionRouter(appModel: appModel, gatewayController: gatewayController)
@@ -385,6 +397,66 @@ struct SwiftUIRenderSmokeTests {
                         try await Task.sleep(for: .milliseconds(10))
                     }
                     #expect(createdProfiles == [session.owner.profileID])
+                } else if isDictation {
+                    let reserved = action == "dictation-reserved"
+                    let originalBinding = try #require(presentation.binding)
+                    var releaseDictation: CheckedContinuation<Void, Never>?
+                    let suspendDictation: @MainActor () async -> Void = {
+                        await withCheckedContinuation { releaseDictation = $0 }
+                    }
+                    if reserved {
+                        appModel.talkMode._test_setPTTReservedHandler(suspendDictation)
+                    } else {
+                        appModel.testTalkCapturePreparationHandler = suspendDictation
+                    }
+                    defer {
+                        appModel.testTalkCapturePreparationHandler = nil
+                        appModel.talkMode._test_setPTTReservedHandler(nil)
+                    }
+                    let transcription = Task { @MainActor in try await appModel.transcribeChatDraft() }
+                    let verification: Result<Void, Error>
+                    do {
+                        let deadline = ContinuousClock.now + .seconds(2)
+                        while releaseDictation == nil, ContinuousClock.now < deadline {
+                            try await Task.sleep(for: .milliseconds(10))
+                        }
+                        try #require(releaseDictation != nil)
+                        try #require(appModel.isChatDictationPending == !reserved)
+                        try #require(appModel.isChatDictationActive == reserved)
+                        let captureID = appModel.talkMode._test_activePushToTalkCaptureId()
+                        #expect((captureID != nil) == reserved)
+                        #expect(!appModel.talkMode._test_audioSessionIsActive())
+
+                        #expect(await router.open(.compose(session, draft: nil)) == .opened)
+                        let outcome = await router.open(.compose(session, draft: "must not join dictation"))
+                        if case let .unavailable(reason) = outcome {
+                            #expect(!reason.isEmpty)
+                        } else {
+                            Issue.record("Compose must reject a draft while dictation owns the composer")
+                        }
+                        #expect(presentation.binding?.matches(originalBinding) == true)
+                        #expect(appModel.isChatDictationPending == !reserved)
+                        #expect(appModel.isChatDictationActive == reserved)
+                        #expect(appModel.talkMode._test_activePushToTalkCaptureId() == captureID)
+                        #expect(!appModel.talkMode._test_audioSessionIsActive())
+                        verification = .success(())
+                    } catch {
+                        verification = .failure(error)
+                    }
+                    // Both barriers precede permission/audio work. Cancel the owner
+                    // before releasing either barrier, including on assertion failure.
+                    transcription.cancel()
+                    appModel.cancelChatDictation()
+                    releaseDictation?.resume()
+                    releaseDictation = nil
+                    await #expect(throws: Error.self) { try await transcription.value }
+                    try verification.get()
+                    #expect(!appModel.isChatDictationPending)
+                    #expect(!appModel.isChatDictationActive)
+                    #expect(appModel._test_pttVoiceWakeLeaseCaptureIds().isEmpty)
+                    #expect(await router.open(.compose(session, draft: "after dictation")) == .opened)
+                    #expect(sentParams.isEmpty)
+                    #expect(createdProfiles.isEmpty)
                 } else {
                     if action == "reopen" {
                         let oldBinding = try #require(presentation.binding)
