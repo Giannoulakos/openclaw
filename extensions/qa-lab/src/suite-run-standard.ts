@@ -159,6 +159,7 @@ export async function runQaFlowSuiteStandard(
         transport.createRuntimeEnvPatch?.(),
         buildQaGatewayHeapCheckpointRuntimeEnvPatch(),
       ),
+      runtimeBootstrap: transport.createRuntimeBootstrap?.(repoRoot),
     });
     writeQaSuiteProgress(
       progressEnabled,

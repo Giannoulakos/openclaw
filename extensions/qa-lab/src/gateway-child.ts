@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { Writable } from "node:stream";
 import { setTimeout as sleep } from "node:timers/promises";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { runQaGatewayCliCommand } from "./gateway-child-command.js";
@@ -111,8 +112,22 @@ async function startOwnedGatewayChild(
       cwd: gatewayCwd,
       env: prepared?.env ?? launch.env,
       detached: process.platform !== "win32",
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: params.runtimeBootstrap
+        ? ["ignore", "pipe", "pipe", "pipe"]
+        : ["ignore", "pipe", "pipe"],
     });
+    if (params.runtimeBootstrap) {
+      const bootstrapInput = child.stdio[3];
+      if (!(bootstrapInput instanceof Writable)) {
+        child.kill();
+        throw new Error("QA Gateway runtime bootstrap pipe was not created");
+      }
+      bootstrapInput.end(params.runtimeBootstrap.payload);
+    }
+    if (!child.stdout || !child.stderr) {
+      child.kill();
+      throw new Error("QA Gateway output pipes were not created");
+    }
     // Register synchronously: acceptance/readiness may reject with descendants
     // still alive, and replacement must immediately supersede its stopped parent.
     active = lifetime.register(child, prepared);

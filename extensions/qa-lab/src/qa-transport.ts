@@ -5,6 +5,7 @@ import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { resolveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
 import type { QaRunnerCliRegistration } from "openclaw/plugin-sdk/qa-runner-runtime";
 import { QaSuiteInfraError } from "./errors.js";
+import type { QaGatewayRuntimeBootstrap } from "./gateway-child-setup.js";
 import type { QaProviderMode } from "./model-selection.js";
 import { extractQaFailureReplyText } from "./reply-failure.js";
 import type {
@@ -315,6 +316,7 @@ export type QaTransportAdapter = Omit<
     timeoutMs?: number,
     intervalMs?: number,
   ) => Promise<T>;
+  createRuntimeBootstrap?: (repoRoot: string) => QaGatewayRuntimeBootstrap;
 };
 
 export abstract class QaStateBackedTransportAdapter implements QaTransportAdapter {
