@@ -49,6 +49,7 @@ type ManagedCommandOptions = {
   env?: NodeJS.ProcessEnv;
   stdio?: StdioOptions;
   shell?: boolean;
+  windowsHide?: boolean;
   windowsVerbatimArguments?: boolean;
   platform?: NodeJS.Platform;
   comSpec?: string;
@@ -651,6 +652,7 @@ export function createManagedCommandSpawnSpec(options: ManagedCommandOptions) {
       env,
       stdio,
       ...invocationOptions,
+      ...(options.windowsHide === undefined ? {} : { windowsHide: options.windowsHide }),
       detached: platform !== "win32",
     },
   };
