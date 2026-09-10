@@ -817,7 +817,8 @@ public actor GatewayNodeSession {
         timeoutSeconds: Int = 15,
         ifCurrentRoute expectedRoute: GatewayNodeSessionRoute? = nil,
         distinguishPreDispatchRouteChange: Bool = false,
-        expectedProfileId: String? = nil) async throws -> Data
+        expectedProfileId: String? = nil,
+        completionPolicy: GatewayRequestCompletionPolicy = .requireCurrentRoute) async throws -> Data
     {
         let params = try decodeParamsJSON(paramsJSON)
         return try await self.request(
@@ -826,7 +827,8 @@ public actor GatewayNodeSession {
             timeoutMs: Double(timeoutSeconds * 1000),
             ifCurrentRoute: expectedRoute,
             distinguishPreDispatchRouteChange: distinguishPreDispatchRouteChange,
-            expectedProfileId: expectedProfileId)
+            expectedProfileId: expectedProfileId,
+            completionPolicy: completionPolicy)
     }
 
     public func request(
@@ -835,7 +837,8 @@ public actor GatewayNodeSession {
         timeoutMs: Double = 15000,
         ifCurrentRoute expectedRoute: GatewayNodeSessionRoute? = nil,
         distinguishPreDispatchRouteChange: Bool = false,
-        expectedProfileId: String? = nil) async throws -> Data
+        expectedProfileId: String? = nil,
+        completionPolicy: GatewayRequestCompletionPolicy = .requireCurrentRoute) async throws -> Data
     {
         if let expectedRoute, !self.isCurrentRoute(expectedRoute) {
             if distinguishPreDispatchRouteChange {
@@ -857,11 +860,15 @@ public actor GatewayNodeSession {
                     params: params,
                     timeoutMs: timeoutMs,
                     ifCurrentConnectionGeneration: expectedRoute.socketGeneration,
-                    expectedProfileId: expectedProfileId))
+                    expectedProfileId: expectedProfileId,
+                    completionPolicy: completionPolicy))
             } catch {
                 result = .failure(error)
             }
-            // A late error has the same route authority as a late payload.
+            if completionPolicy.preservesSuccessfulResponse(for: method), case let .success(data) = result {
+                return data
+            }
+            // A late error has the same route authority as a late read payload.
             // Revalidate before either outcome reaches a replacement owner.
             guard self.isCurrentRoute(expectedRoute), self.channel === channel else {
                 throw CancellationError()
@@ -872,7 +879,8 @@ public actor GatewayNodeSession {
             method: method,
             params: params,
             timeoutMs: timeoutMs,
-            expectedProfileId: expectedProfileId)
+            expectedProfileId: expectedProfileId,
+            completionPolicy: completionPolicy)
     }
 
     public func subscribeServerEvents(bufferingNewest: Int = 200) -> AsyncStream<EventFrame> {

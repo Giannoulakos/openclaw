@@ -2485,6 +2485,111 @@ struct GatewayNodeSessionTests {
         await gateway.disconnect()
     }
 
+    @Test(arguments: [
+        "receipt", "unbound-receipt", "ack-first-disconnect", "default",
+        "read", "wrong-case", "denial", "cancel-first", "disconnect-first",
+    ])
+    func `chat send completion policy preserves only the response that won`(scenario: String) async throws {
+        let session = FakeGatewayWebSocketSession()
+        let channel = try GatewayChannelActor(
+            url: testURL("ws://receipt.example.invalid"),
+            token: nil,
+            session: WebSocketSessionBox(session: session),
+            connectOptions: nodeConnectOptions())
+        try await channel.connect()
+        let socket = try #require(session.latestTask())
+        let generation = try #require(await channel.currentConnectionGeneration())
+        let resumed = AsyncGate()
+        await channel._test_setRequestResumedHandler { await resumed.wait() }
+        let method = scenario == "read" ? "chat.history" : scenario == "wrong-case" ? "Chat.send" : "chat.send"
+        let request = Task {
+            if scenario == "default" {
+                return try await channel.request(method: method, params: nil)
+            }
+            if scenario == "unbound-receipt" {
+                return try await channel.request(
+                    method: method, params: nil, completionPolicy: .preserveChatSendSuccess)
+            }
+            return try await channel.request(
+                method: method, params: nil,
+                ifCurrentConnectionGeneration: generation,
+                completionPolicy: .preserveChatSendSuccess)
+        }
+        do {
+            try await waitUntil("receipt request sent") { socket.sentRequestCount(method: method) == 1 }
+            let sent = try #require(socket.sentRequests(method: method).first)
+            if scenario == "cancel-first" {
+                request.cancel()
+                try await waitUntil("cancellation won pending removal") { await resumed.hasStarted() }
+            } else if scenario == "disconnect-first" {
+                await channel.shutdown()
+                try await waitUntil("disconnect won pending removal") { await resumed.hasStarted() }
+            }
+            try socket.emitResponse(
+                id: #require(sent["id"] as? String),
+                payload: ["runId": "original-run", "status": "started"],
+                error: scenario == "denial" ? ["code": "INVALID_REQUEST", "message": "Denied"] : nil)
+            try await waitUntil("request resumed") { await resumed.hasStarted() }
+            #expect(await channel._test_pendingRequestCount() == 0)
+            if scenario == "ack-first-disconnect" { await channel.shutdown() }
+            request.cancel()
+            await resumed.release()
+            if ["receipt", "unbound-receipt", "ack-first-disconnect"].contains(scenario) {
+                let payload = try JSONDecoder().decode([String: String].self, from: await request.value)
+                #expect(payload == ["runId": "original-run", "status": "started"])
+            } else {
+                await #expect(throws: CancellationError.self) { try await request.value }
+            }
+            #expect(socket.sentRequestCount(method: method) == 1)
+        } catch {
+            request.cancel()
+            await resumed.release()
+            await channel.shutdown()
+            _ = try? await request.value
+            throw error
+        }
+        await channel.shutdown()
+    }
+
+    @Test(arguments: ["receipt", "default", "read", "denial"])
+    func `received send success survives node route retirement but reads and errors do not`(
+        scenario: String) async throws
+    {
+        let session = FakeGatewayWebSocketSession()
+        let gateway = GatewayNodeSession()
+        try await gateway.connectForTest(
+            testURL("ws://receipt.example.invalid"), options: nodeConnectOptions(), session: session)
+        let route = try #require(await gateway.currentRoute())
+        let socket = try #require(session.latestTask())
+        let method = scenario == "read" ? "chat.history" : "chat.send"
+        let request = Task {
+            try await gateway.request(
+                method: method, paramsJSON: nil, ifCurrentRoute: route,
+                completionPolicy: scenario == "default" ? .requireCurrentRoute : .preserveChatSendSuccess)
+        }
+        do {
+            try await waitUntil("bound receipt request sent") { socket.sentRequestCount(method: method) == 1 }
+            let sent = try #require(socket.sentRequests(method: method).first)
+            await gateway._test_handleChannelDisconnected("retired admission", socketGeneration: 1)
+            try socket.emitResponse(
+                id: #require(sent["id"] as? String),
+                payload: ["runId": "original-run", "status": "started"],
+                error: scenario == "denial" ? ["code": "INVALID_REQUEST", "message": "Denied"] : nil)
+            if scenario == "receipt" {
+                let data = try await request.value
+                #expect(try JSONDecoder().decode([String: String].self, from: data)["runId"] == "original-run")
+            } else {
+                await #expect(throws: CancellationError.self) { try await request.value }
+            }
+        } catch {
+            request.cancel()
+            await gateway.disconnect()
+            _ = try? await request.value
+            throw error
+        }
+        await gateway.disconnect()
+    }
+
     @Test(arguments: [String?.none, "profile-a"])
     func `captured route bound operations never use a replacement channel`(expectedProfileId: String?) async throws {
         let session = FakeGatewayWebSocketSession()

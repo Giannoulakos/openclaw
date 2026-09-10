@@ -51,17 +51,22 @@ private actor NativeSubmissionTransport: OpenClawChatTransport {
     let response: Response
     let ackStatus: String
     let ackRunID: String?
+    let ackSummary: String?
     let validationGateCall: Int
     private var responseError: GatewayResponseError?
     private var generation = 0
     private(set) var validationCalls = 0
     private(set) var catalogLoads = 0
     private(set) var sent: [Sent] = []
+    private(set) var historyCalls = 0
+    private(set) var historyReturns = 0
+    private var historyPayload: OpenClawChatHistoryPayload?
 
     init(
         response: Response = .accepted,
         ackStatus: String = "started",
         ackRunID: String? = nil,
+        ackSummary: String? = nil,
         sendGate: NativeSubmissionGate? = nil,
         historyGate: NativeSubmissionGate? = nil,
         validationGate: NativeSubmissionGate? = nil,
@@ -73,6 +78,7 @@ private actor NativeSubmissionTransport: OpenClawChatTransport {
         self.response = response
         self.ackStatus = ackStatus
         self.ackRunID = ackRunID
+        self.ackSummary = ackSummary
         self.sendGate = sendGate
         self.historyGate = historyGate
         self.validationGate = validationGate
@@ -88,6 +94,10 @@ private actor NativeSubmissionTransport: OpenClawChatTransport {
 
     func setResponseError(_ error: GatewayResponseError) {
         self.responseError = error
+    }
+
+    func setHistoryPayload(_ payload: OpenClawChatHistoryPayload) {
+        self.historyPayload = payload
     }
 
     func route(
@@ -130,7 +140,8 @@ private actor NativeSubmissionTransport: OpenClawChatTransport {
         case .accepted:
             return OpenClawChatSendResponse(
                 runId: self.ackRunID ?? "remote-\(message.id)",
-                status: self.ackStatus)
+                status: self.ackStatus,
+                summary: self.ackSummary)
         case .rejected:
             return OpenClawChatSendResponse(runId: message.id, status: "error")
         case .uncertain:
@@ -157,7 +168,10 @@ private actor NativeSubmissionTransport: OpenClawChatTransport {
     }
 
     func requestHistory(sessionKey _: String) async throws -> OpenClawChatHistoryPayload {
+        self.historyCalls += 1
         await self.historyGate?.wait()
+        self.historyReturns += 1
+        if let historyPayload { return historyPayload }
         throw URLError(.notConnectedToInternet)
     }
 
@@ -243,6 +257,27 @@ private struct NativeSubmissionFixture {
 
 @MainActor
 private struct ChatExternalSubmissionTests {
+    @Test(arguments: ["idle", "reply", "attachment", "staging", "pending", "sending", "submitting"])
+    func `native reopen can retain only idle text`(state: String) async throws {
+        let fixture = try NativeSubmissionFixture(transport: NativeSubmissionTransport())
+        fixture.vm.input = "retained text"
+        switch state {
+        case "reply":
+            fixture.vm.setReplyTarget(messageID: UUID(), text: "quoted turn", senderLabel: "User")
+        case "attachment":
+            fixture.vm.attachments = [OpenClawPendingAttachment(
+                url: nil, data: Data([1]), fileName: "draft.png", mimeType: "image/png", preview: nil)]
+        case "staging": fixture.vm.attachmentStagingCount = 1
+        case "pending": fixture.vm.pendingRuns.insert("running")
+        case "sending": fixture.vm.isSending = true
+        case "submitting": fixture.vm.isSubmittingDraft = true
+        default: break
+        }
+        #expect(fixture.vm.canPreserveIdleTextDraft == (state == "idle"))
+        #expect(fixture.vm.input == "retained text")
+        await fixture.close()
+    }
+
     @Test(arguments: ["not_started", "may_have_executed", "unknown", "missing", "malformed"])
     func `profile mismatch needs explicit non execution evidence and never replays`(execution: String) async throws {
         var details = ["reason": AnyCodable("EXPECTED_PROFILE_MISMATCH")]
@@ -502,6 +537,93 @@ private struct ChatExternalSubmissionTests {
         await fixture.close()
     }
 
+    @Test(arguments: ["committed", "empty-history", "empty-run"])
+    func `aborted timeout receipt retains its operation but history owns the user turn`(
+        scenario: String) async throws
+    {
+        let emptyRunID = scenario == "empty-run"
+        let fixture = try NativeSubmissionFixture(transport: NativeSubmissionTransport(
+            ackStatus: "timeout", ackRunID: emptyRunID ? "" : "admitted-run", ackSummary: "aborted"))
+        await fixture.prepare()
+        let messages = scenario == "committed"
+            ? #"[{"role":"user","content":[{"type":"text","text":"external text"}],"idempotencyKey":"admitted-run:user"}]"#
+            : "[]"
+        await fixture.transport.setHistoryPayload(try JSONDecoder().decode(
+            OpenClawChatHistoryPayload.self,
+            from: Data(#"{"sessionKey":"\#(fixture.target.sessionKey)","messages":\#(messages)}"#.utf8)))
+        let invocation = fixture.request()
+        let route = await fixture.transport.route(fixture.target)
+        let result = await fixture.vm.submit(invocation, using: route)
+        if emptyRunID {
+            if case .uncertain = result {} else { Issue.record("An empty run ID cannot establish a continuation") }
+        } else {
+            #expect(result == .accepted(runID: "admitted-run"))
+            do {
+                try await waitUntil("aborted run reconciled") {
+                    await MainActor.run { fixture.vm.pendingRunCount == 0 }
+                }
+                #expect(fixture.vm.errorText == nil)
+                #expect(fixture.vm.messages.contains { $0.role == "user" } == (scenario == "committed"))
+            } catch {
+                await fixture.close()
+                throw error
+            }
+        }
+        #expect(await fixture.vm.submit(invocation, using: route) == result)
+        #expect(await fixture.transport.sent.count == 1)
+        await fixture.close()
+    }
+
+    @Test(arguments: [false, true])
+    func `retired native reconciliation cannot change the retained presentation`(duringHistory: Bool) async throws {
+        let gate = NativeSubmissionGate()
+        let transport = NativeSubmissionTransport(
+            ackStatus: "ok",
+            historyGate: duringHistory ? gate : nil,
+            validationGate: duringHistory ? nil : gate,
+            validationGateCall: 4)
+        let fixture = try NativeSubmissionFixture(transport: transport)
+        await fixture.prepare()
+        await transport.setHistoryPayload(try JSONDecoder().decode(
+            OpenClawChatHistoryPayload.self,
+            from: Data("""
+            {"sessionKey":"\(fixture.target.sessionKey)","messages":[
+              {"role":"assistant","content":[{"type":"text","text":"stale history"}],"timestamp":1}
+            ]}
+            """.utf8)))
+        let invocation = fixture.request()
+        let route = await transport.route(fixture.target)
+        #expect(await fixture.vm.submit(invocation, using: route) ==
+            .accepted(runID: "remote-\(invocation.operationID.uuidString)"))
+        do {
+            try await waitUntil("reconciliation suspended") { await gate.entered }
+            let messages = fixture.vm.messages.map(\.id)
+            let pending = fixture.vm.pendingRuns
+            let validations = await transport.validationCalls
+            await transport.invalidate()
+            fixture.vm.errorText = "retained presentation"
+            await gate.open()
+            if duringHistory {
+                try await waitUntil("history returned through route fence") {
+                    let returned = await transport.historyReturns
+                    let checked = await transport.validationCalls
+                    return returned == 1 && checked > validations
+                }
+            }
+            let readback = await fixture.vm.submit(invocation, using: route)
+            if case .uncertain = readback {} else { Issue.record("Expired readback requires authority") }
+            #expect(fixture.vm.messages.map(\.id) == messages)
+            #expect(fixture.vm.pendingRuns == pending)
+            #expect(fixture.vm.errorText == "retained presentation")
+            #expect(await transport.historyCalls == (duringHistory ? 1 : 0))
+            #expect(await transport.sent.count == 1)
+        } catch {
+            await fixture.close()
+            throw error
+        }
+        await fixture.close()
+    }
+
     @Test(arguments: [false, true])
     func `route invalidation before or after dispatch is distinguished`(afterDispatch: Bool) async throws {
         let gate = NativeSubmissionGate()
@@ -535,7 +657,7 @@ private struct ChatExternalSubmissionTests {
             }
             #expect(await transport.sent.count == (afterDispatch ? 1 : 0))
             #expect(fixture.vm.input.isEmpty)
-            #expect(fixture.vm.pendingRunCount == 0)
+            #expect(fixture.vm.pendingRunCount == (afterDispatch ? 1 : 0))
         } catch {
             await fixture.close()
             _ = await task.value

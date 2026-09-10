@@ -459,7 +459,8 @@ struct ChatProTab: View {
             ?? Self.transportAgentID(self.appModel.chatDeliveryAgentId)
         let presentationAgentID = self.nativeBinding?.session.agentID
             ?? self.normalized(self.appModel.chatAgentId) ?? "main"
-        let routingContract = self.nativeBinding == nil ? (self.appModel.chatSessionRoutingContract ?? "") : ""
+        let routingContract = (self.nativeBinding == nil
+            ? self.appModel.chatSessionRoutingContract : self.nativeBinding?.sessionRoutingContract) ?? ""
         let bindingMatches: Bool = switch (self.viewModelTransport?.nativeBinding, self.nativeBinding) {
         case (nil, nil): true
         case let (current?, next?): current.matches(next)
@@ -474,7 +475,8 @@ struct ChatProTab: View {
             if self.viewModelRoutingContract != routingContract {
                 self.viewModelRoutingContract = routingContract
                 viewModel.syncSessionRoutingContract(
-                    self.nativeBinding == nil ? self.appModel.chatSessionRoutingContract : nil)
+                    self.nativeBinding == nil
+                        ? self.appModel.chatSessionRoutingContract : self.nativeBinding?.sessionRoutingContract)
             }
             viewModel.syncSession(to: sessionKey)
             if !viewModel.isAttachmentOwnerPinned {
@@ -485,15 +487,28 @@ struct ChatProTab: View {
         // Keep recording, staging, and delivery on their captured route.
         // The protected-composer observer replays this rebuild after the last owner clears.
         guard self.viewModel?.isAttachmentOwnerPinned != true else { return }
-        // A transport cannot be replaced under an unsent composer, including a
-        // same-session transition from ordinary UI to an account-bound action.
-        if !bindingMatches, self.hasProtectedComposer { return }
+        let preservedInput: String?
+        if let viewModel, let previous = self.viewModelTransport?.nativeBinding, let nativeBinding,
+           previous.canReopen(
+               nativeBinding,
+               preserving: viewModel,
+               captureIsActive: self.appModel.isTalkCaptureActive ||
+                   self.appModel.isChatDictationPending || self.appModel.isChatDictationActive)
+        {
+            // A fresh verified presentation may retain text, never its old
+            // transport, pending run, attachment, or prepared-send authority.
+            preservedInput = viewModel.input
+        } else {
+            if !bindingMatches, self.hasProtectedComposer { return }
+            preservedInput = nil
+        }
         self.viewModel?.detachTransport()
         self.viewModelOwnerID = ownerID
         self.viewModelTransportAgentID = transportAgentID
         self.viewModelRoutingContract = routingContract
         self.captureCurrentPresentationIdentity(agentID: presentationAgentID)
         self.viewModel = self.makeChatViewModel(sessionKey: sessionKey)
+        if let preservedInput { self.viewModel?.input = preservedInput }
     }
 
     private var activationIdentity: ActivationIdentity {
@@ -558,7 +573,8 @@ struct ChatProTab: View {
             // gateway owner even if app state switches between these calls.
             transport: transport,
             activeAgentId: binding?.session.agentID ?? self.appModel.chatDeliveryAgentId,
-            sessionRoutingContract: binding == nil ? self.appModel.chatSessionRoutingContract : nil,
+            sessionRoutingContract: binding == nil
+                ? self.appModel.chatSessionRoutingContract : binding?.sessionRoutingContract,
             attachmentOwnerIsActive: { voiceNoteRecorder.ownsPendingChatAttachment },
             transcriptCache: offlineStore,
             outbox: offlineStore,
@@ -991,6 +1007,9 @@ extension ChatProTab {
                 self.syncChatViewModel()
             }
             .onChange(of: self.appModel.chatSessionRoutingContract) { _, _ in
+                self.syncChatViewModel()
+            }
+            .onChange(of: self.nativeBinding?.sessionRoutingContract) { _, _ in
                 self.syncChatViewModel()
             }
     }

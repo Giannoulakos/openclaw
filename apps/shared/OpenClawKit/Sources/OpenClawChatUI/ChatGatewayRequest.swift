@@ -788,7 +788,8 @@ extension GatewayNodeSession {
         _ request: OpenClawChatGatewayRequest,
         ifCurrentRoute expectedRoute: GatewayNodeSessionRoute? = nil,
         distinguishPreDispatchRouteChange: Bool = false,
-        expectedProfileId: String? = nil) async throws -> Data
+        expectedProfileId: String? = nil,
+        completionPolicy: GatewayRequestCompletionPolicy = .requireCurrentRoute) async throws -> Data
     {
         try await self.request(
             method: request.method,
@@ -796,6 +797,7 @@ extension GatewayNodeSession {
             timeoutMs: request.timeoutMs,
             ifCurrentRoute: expectedRoute,
             distinguishPreDispatchRouteChange: distinguishPreDispatchRouteChange,
-            expectedProfileId: expectedProfileId)
+            expectedProfileId: expectedProfileId,
+            completionPolicy: completionPolicy)
     }
 }

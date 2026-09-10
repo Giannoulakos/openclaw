@@ -1,9 +1,9 @@
 import Foundation
-import OpenClawKit
 import OpenClawProtocol
 import Testing
 @testable import OpenClaw
 @testable import OpenClawChatUI
+@testable import OpenClawKit
 
 struct IOSGatewayChatTransportTests {
     private actor ProgressRequestRecorder {
@@ -128,9 +128,12 @@ struct IOSGatewayChatTransportTests {
         gatewayID: String? = nil,
         capabilities: [String] = [],
         nativeProfileID: String? = nil,
+        sendPayload: String = #"{"runId":"submitted-run","status":"started"}"#,
+        retireOnSend: Bool = false,
         _ run: (IOSGatewayChatTransport, RequestRecorder) async throws -> Void) async throws
     {
         let recorder = RequestRecorder()
+        let gateway = GatewayNodeSession()
         let session = GatewayTestWebSocketSession(taskFactory: {
             GatewayTestWebSocketTask(sendHook: { socket, message, sendIndex in
                 guard sendIndex > 0 else { return }
@@ -149,9 +152,12 @@ struct IOSGatewayChatTransportTests {
                     {"sessionKey":"agent:reviewer:main","messages":[],
                      "sessionInfo":{"key":"agent:reviewer:main","agentId":"reviewer"}}
                     """
-                case "chat.send": #"{"runId":"submitted-run","status":"started"}"#
+                case "chat.send": sendPayload
                 case "sessions.messages.subscribe": #"{"subscribed":true,"key":"agent:reviewer:main"}"#
                 default: #"{"entry":{}}"#
+                }
+                if retireOnSend, request.method == "chat.send" {
+                    await gateway._test_handleChannelDisconnected("retired admission", socketGeneration: 1)
                 }
                 socket.emitReceiveSuccess(.data(Data(
                     #"{"type":"res","id":"\#(request.id)","ok":true,"payload":\#(payload)}"#.utf8)))
@@ -172,7 +178,6 @@ struct IOSGatewayChatTransportTests {
                 return try .data(JSONSerialization.data(withJSONObject: frame))
             })
         })
-        let gateway = GatewayNodeSession()
         var options = GatewayWebSocketTestSupport.identityFreeOperatorConnectOptions
         options.allowStoredDeviceAuth = false
         options.deviceAuthGatewayID = gatewayID
@@ -903,6 +908,36 @@ struct IOSGatewayChatTransportTests {
 }
 
 extension IOSGatewayChatTransportTests {
+    @Test(arguments: [false, true])
+    func `native send receipt crosses retired postresponse fences but malformed data does not`(
+        malformed: Bool) async throws
+    {
+        try await self.withSessionTransport(
+            gatewayID: "gateway-a",
+            capabilities: ["profile-binding-v1"],
+            nativeProfileID: "profile-a",
+            sendPayload: malformed ? #"{"status":"started"}"# : #"{"runId":"original-run","status":"started"}"#,
+            retireOnSend: true)
+        { transport, recorder in
+            let binding = try #require(transport.nativeBinding)
+            do {
+                let response = try await transport.sendMessage(
+                    sessionKey: binding.session.sessionKey,
+                    message: "one invocation",
+                    thinking: nil,
+                    idempotencyKey: "original-invocation",
+                    attachments: [],
+                    ifCurrentRoute: binding.route)
+                #expect(!malformed)
+                #expect(response.runId == "original-run")
+            } catch is CancellationError {
+                #expect(malformed)
+            }
+            #expect(await binding.isCurrent() == false)
+            #expect(await recorder.all().filter { $0.method == "chat.send" }.count == 1)
+        }
+    }
+
     @Test(arguments: [nil, "profile-e\u{301}", "profile-\u{E9}"] as [String?])
     func `native chat forwards one exact profile through reads subscriptions and the existing send lease`(
         profileID: String?) async throws

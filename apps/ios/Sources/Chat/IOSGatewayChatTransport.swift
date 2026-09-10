@@ -16,18 +16,20 @@ struct IOSGatewayChatTransport: OpenClawChatGatewayTransport {
     func requestChatGateway(
         _ request: OpenClawChatGatewayRequest,
         ifCurrentRoute expectedRoute: GatewayNodeSessionRoute?,
-        distinguishPreDispatchRouteChange: Bool = false) async throws -> Data
+        distinguishPreDispatchRouteChange: Bool = false,
+        completionPolicy: GatewayRequestCompletionPolicy = .requireCurrentRoute) async throws -> Data
     {
         if let nativeBinding {
             guard expectedRoute == nil || expectedRoute == nativeBinding.route else {
                 throw GatewayNodeSessionRequestError.routeChangedBeforeDispatch
             }
-            return try await nativeBinding.request(request)
+            return try await nativeBinding.request(request, completionPolicy: completionPolicy)
         }
         return try await self.gateway.request(
             request,
             ifCurrentRoute: expectedRoute,
-            distinguishPreDispatchRouteChange: distinguishPreDispatchRouteChange)
+            distinguishPreDispatchRouteChange: distinguishPreDispatchRouteChange,
+            completionPolicy: completionPolicy)
     }
 
     static let logger = Logger(subsystem: "ai.openclawfoundation.app", category: "ios.chat.transport")

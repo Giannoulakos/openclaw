@@ -335,8 +335,19 @@ extension IOSGatewayChatTransport {
             let res = try await self.requestChatGateway(
                 request,
                 ifCurrentRoute: requestRoute,
-                distinguishPreDispatchRouteChange: distinguishPreDispatchRouteChange)
-            let decoded = try JSONDecoder().decode(OpenClawChatSendResponse.self, from: res)
+                distinguishPreDispatchRouteChange: distinguishPreDispatchRouteChange,
+                completionPolicy: self.nativeBinding == nil ? .requireCurrentRoute : .preserveChatSendSuccess)
+            let decoded: OpenClawChatSendResponse
+            do {
+                decoded = try JSONDecoder().decode(OpenClawChatSendResponse.self, from: res)
+            } catch {
+                // Malformed successes are not receipts. This is post-dispatch:
+                // never turn lost authority into a safe-to-retry admission error.
+                let isCurrent = await self.nativeBinding?.isCurrent() ?? true
+                try Task.checkCancellation()
+                guard isCurrent else { throw CancellationError() }
+                throw error
+            }
             Self.logger.info("chat.send ok runId=\(decoded.runId, privacy: .public)")
             GatewayDiagnostics.log("chat.send ok runId=\(decoded.runId) status=\(decoded.status)")
             return decoded

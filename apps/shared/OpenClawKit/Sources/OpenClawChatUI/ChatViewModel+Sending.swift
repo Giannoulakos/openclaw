@@ -169,6 +169,12 @@ extension OpenClawChatViewModel {
         return !trimmed.isEmpty || !attachments.isEmpty
     }
 
+    /// Only idle text may survive an explicitly verified replacement transport.
+    public var canPreserveIdleTextDraft: Bool {
+        !self.isSubmittingDraft && !self.isSending && !self.hasBlockingRunActivity &&
+            !self.isAborting && self.replyTarget == nil && !self.isAttachmentOwnerPinned
+    }
+
     var hasBlockingRunActivity: Bool {
         pendingRunCount > 0 || self.hasAdvertisedLiveRun ||
             hasActiveSessionRunWithoutChatSnapshot || isSwitchingSessionBranch
@@ -483,6 +489,11 @@ extension OpenClawChatViewModel {
         var isComposer: Bool {
             if case .composer = self.source { return true }
             return false
+        }
+
+        var externalRoute: OpenClawChatExternalSubmissionRoute? {
+            if case let .external(_, route) = self.source { return route }
+            return nil
         }
 
         var messageText: String {
@@ -913,7 +924,9 @@ extension OpenClawChatViewModel {
                     attachments: attempt.encodedAttachments)
             }
             if !attempt.draft.isComposer {
-                if response.status == "error" || response.status == "timeout" {
+                if !response.runId.isEmpty,
+                   response.status == "error" || (response.status == "timeout" && !response.isAbortedRun)
+                {
                     await self.handleLiveSendFailure(
                         NSError(
                             domain: "OpenClawChatSubmission",
@@ -922,17 +935,17 @@ extension OpenClawChatViewModel {
                         attempt: attempt)
                     return .rejected(reason: "Run failed to start (\(response.status)).")
                 }
-                guard ["started", "in_flight", "ok"].contains(response.status), !response.runId.isEmpty else {
+                guard ["started", "in_flight", "ok"].contains(response.status) || response.isAbortedRun,
+                      !response.runId.isEmpty
+                else {
                     await self.handleLiveSendFailure(URLError(.badServerResponse), attempt: attempt)
                     return .uncertain(reason: "The Gateway did not confirm acceptance. Check the chat before retrying.")
                 }
             }
-            if isCurrentSession(attempt.draft.session) {
-                await self.handleLiveSendResponse(response, attempt: attempt)
-            }
+            await self.handleLiveSendResponse(response, attempt: attempt)
             // The ACK belongs to the captured target even if presentation was
             // replaced while it arrived. Never turn known acceptance into retry.
-            return response.status == "error" || response.status == "timeout"
+            return response.status == "error" || (response.status == "timeout" && !response.isAbortedRun)
                 ? .rejected(reason: "Run failed to start (\(response.status)).")
                 : .accepted(runID: response.runId)
         } catch {
@@ -961,10 +974,17 @@ extension OpenClawChatViewModel {
         }
     }
 
+    private func canPresentLiveSend(_ attempt: LiveSendAttempt) async -> Bool {
+        if let route = attempt.draft.externalRoute, await !route.isCurrent() { return false }
+        // Route validation suspends. Check the captured session afterwards.
+        return self.isCurrentSession(attempt.draft.session)
+    }
+
     private func handleLiveSendResponse(
         _ response: OpenClawChatSendResponse,
         attempt: LiveSendAttempt) async
     {
+        guard await self.canPresentLiveSend(attempt) else { return }
         let sessionKey = attempt.draft.session.key
         logDiagnostic(
             "chat.ui transport send accepted sessionKey=\(sessionKey) "
@@ -994,7 +1014,7 @@ extension OpenClawChatViewModel {
                     userMessageTimestamp: attempt.userMessageTimestamp)
             }
             Task {
-                guard self.isCurrentSession(attempt.draft.session) else { return }
+                guard await self.canPresentLiveSend(attempt) else { return }
                 await self.reconcileLiveSendResponse(
                     response,
                     attempt: attempt,
@@ -1008,11 +1028,19 @@ extension OpenClawChatViewModel {
         attempt: LiveSendAttempt,
         reusedRunAlreadyFinal: Bool) async
     {
-        if response.status == "ok" {
+        guard await self.canPresentLiveSend(attempt) else { return }
+        if response.status == "ok" || response.isAbortedRun {
+            // A cached abort can precede the user transcript commit. Remove the
+            // optimistic row first; only authoritative history may put it back.
+            if response.isAbortedRun { self.removePendingLocalUserEcho(for: response.runId) }
             let historyContext = beginHistoryRequest(for: attempt.draft.session)
-            await refreshHistoryAfterRun(historyRequest: historyContext)
-            guard isCurrentSession(attempt.draft.session) else { return }
-            finishPendingRunAfterTerminalOkSendAck(response)
+            await refreshHistoryAfterRun(
+                historyRequest: historyContext,
+                externalRoute: attempt.draft.externalRoute)
+            guard await self.canPresentLiveSend(attempt) else { return }
+            if !finishPendingRunIfTerminalSendAck(response) {
+                finishPendingRunAfterTerminalOkSendAck(response)
+            }
             return
         }
         guard !finishPendingRunIfTerminalSendAck(response),
@@ -1022,8 +1050,10 @@ extension OpenClawChatViewModel {
         }
 
         let historyContext = beginHistoryRequest(for: attempt.draft.session)
-        let refresh = await refreshHistoryAfterRun(historyRequest: historyContext)
-        guard isCurrentSession(attempt.draft.session) else { return }
+        let refresh = await refreshHistoryAfterRun(
+            historyRequest: historyContext,
+            externalRoute: attempt.draft.externalRoute)
+        guard await self.canPresentLiveSend(attempt) else { return }
         if refresh.hasInFlightRun || (refresh.applied && !refresh.runSnapshotApplied) ||
             !clearPendingRunIfAssistantMessagePresent(
                 runId: response.runId,
@@ -1071,7 +1101,7 @@ extension OpenClawChatViewModel {
         durableSessionSettingsExpectation: OpenClawChatSessionSettingsExpectation? = nil,
         canPreserveInOutbox: Bool = true) async
     {
-        guard isCurrentSession(attempt.draft.session) else { return }
+        guard await self.canPresentLiveSend(attempt) else { return }
         if attempt.draft.isComposer,
            canPreserveInOutbox,
            let durableSessionSettingsExpectation,

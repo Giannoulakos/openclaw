@@ -759,6 +759,17 @@ public struct OpenClawSessionsPreviewPayload: Codable, Sendable {
 public struct OpenClawChatSendResponse: Codable, Sendable {
     public let runId: String
     public let status: String
+    public let summary: String?
+
+    public init(runId: String, status: String, summary: String? = nil) {
+        self.runId = runId
+        self.status = status
+        self.summary = summary
+    }
+
+    var isAbortedRun: Bool {
+        self.status == "timeout" && self.summary == "aborted" && !self.runId.isEmpty
+    }
 }
 
 public struct OpenClawChatCreateSessionResponse: Codable, Sendable {

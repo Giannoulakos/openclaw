@@ -1,6 +1,18 @@
 import CryptoKit
 import Foundation
 
+public enum GatewayRequestCompletionPolicy: Sendable {
+    case requireCurrentRoute
+    case preserveChatSendSuccess
+
+    public func preservesSuccessfulResponse(for method: String) -> Bool {
+        switch self {
+        case .requireCurrentRoute: false
+        case .preserveChatSendSuccess: method == "chat.send"
+        }
+    }
+}
+
 func gatewayIntValue(_ value: Any?) -> Int? {
     if let value = value as? Int {
         return value

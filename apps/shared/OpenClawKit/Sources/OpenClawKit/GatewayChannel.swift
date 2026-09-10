@@ -1348,7 +1348,8 @@ extension GatewayChannelActor {
         method: String,
         params: [String: AnyCodable]?,
         timeoutMs: Double? = nil,
-        expectedProfileId: String? = nil) async throws -> Data
+        expectedProfileId: String? = nil,
+        completionPolicy: GatewayRequestCompletionPolicy = .requireCurrentRoute) async throws -> Data
     {
         try Task.checkCancellation()
         try await self.connectOrThrow(context: "gateway connect")
@@ -1369,7 +1370,8 @@ extension GatewayChannelActor {
             timeoutMs: timeoutMs,
             task: task,
             connectionGeneration: connectionGeneration,
-            expectedProfileId: expectedProfileId)
+            expectedProfileId: expectedProfileId,
+            completionPolicy: completionPolicy)
     }
 
     /// Sends a request only on an already-connected physical socket. Unlike
@@ -1379,7 +1381,8 @@ extension GatewayChannelActor {
         params: [String: AnyCodable]?,
         timeoutMs: Double? = nil,
         ifCurrentConnectionGeneration expectedGeneration: UInt64,
-        expectedProfileId: String? = nil) async throws -> Data
+        expectedProfileId: String? = nil,
+        completionPolicy: GatewayRequestCompletionPolicy = .requireCurrentRoute) async throws -> Data
     {
         guard self.isConnected(connectionGeneration: expectedGeneration),
               let task = self.task,
@@ -1391,7 +1394,8 @@ extension GatewayChannelActor {
             timeoutMs: timeoutMs,
             task: task,
             connectionGeneration: expectedGeneration,
-            expectedProfileId: expectedProfileId)
+            expectedProfileId: expectedProfileId,
+            completionPolicy: completionPolicy)
     }
 
     /// The generation is usable as a lease only while its socket is live.
@@ -1409,7 +1413,8 @@ extension GatewayChannelActor {
         timeoutMs: Double?,
         task: WebSocketTaskBox,
         connectionGeneration: UInt64,
-        expectedProfileId: String?) async throws -> Data
+        expectedProfileId: String?,
+        completionPolicy: GatewayRequestCompletionPolicy) async throws -> Data
     {
         // Zero leaves terminal-operation deadlines to the Gateway owner.
         let effectiveTimeout = Self.resolveRequestTimeoutMs(timeoutMs, defaultMs: self.defaultRequestTimeoutMs)
@@ -1483,21 +1488,27 @@ extension GatewayChannelActor {
             await testRequestResumedHandler()
         }
         #endif
+        let result = Result<Data, Error> {
+            guard case let .res(res) = response else {
+                throw NSError(domain: "Gateway", code: 2, userInfo: [NSLocalizedDescriptionKey: "unexpected frame"])
+            }
+            if res.ok == false {
+                throw GatewayResponseError(
+                    method: method,
+                    code: res.error?.code,
+                    message: res.error?.message,
+                    details: gatewayErrorDetails(res.error))
+            }
+            // Preserve JSON types without ObjC bridging. Encoding failures remain errors.
+            return try res.payload.map { try self.encoder.encode($0) } ?? Data()
+        }
+        // Only a successful response that won the original pending request is a
+        // receipt. Cancellation still fences reads, RPC errors, and encoding failures.
+        if completionPolicy.preservesSuccessfulResponse(for: method), case let .success(data) = result {
+            return data
+        }
         try Task.checkCancellation()
-        guard case let .res(res) = response else {
-            throw NSError(domain: "Gateway", code: 2, userInfo: [NSLocalizedDescriptionKey: "unexpected frame"])
-        }
-        if res.ok == false {
-            let code = res.error?.code
-            let msg = res.error?.message
-            let details = gatewayErrorDetails(res.error)
-            throw GatewayResponseError(method: method, code: code, message: msg, details: details)
-        }
-        if let payload = res.payload {
-            // Encode back to JSON with Swift's encoder to preserve types and avoid ObjC bridging exceptions.
-            return try self.encoder.encode(payload)
-        }
-        return Data() // Should not happen, but tolerate empty payloads.
+        return try result.get()
     }
 
     public func send(method: String, params: [String: AnyCodable]?) async throws {
