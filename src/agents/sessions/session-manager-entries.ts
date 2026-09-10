@@ -1,9 +1,11 @@
+import { isDeepStrictEqual } from "node:util";
 import {
   readActiveTranscriptEntryAnchor,
   readTranscriptMutationAtSync,
   validatePreparedAssistantAppendSync,
   type TranscriptEntryAnchor,
 } from "../../config/sessions/session-accessor.js";
+import { readAuthoritativeTranscriptEntryAnchor } from "../../config/sessions/session-accessor.sqlite-transcript-mirror.js";
 import { resolveSessionTranscriptReadFence } from "../../config/sessions/session-transcript-read-fence.js";
 import { applyAssistantDeliveryDirectives } from "../../config/sessions/transcript-assistant-delivery.js";
 import { isSessionTranscriptSideAppendEntry } from "../../config/sessions/transcript-tree.js";
@@ -151,10 +153,34 @@ export class SessionManagerEntries extends SessionManagerPersistence {
       persistenceResult = this.persist(canonicalEntry, retryOptions);
     }
     if (persistenceResult?.adoptedMessageId) {
+      const toolResult =
+        canonicalEntry.type === "message" && canonicalEntry.message.role === "toolResult"
+          ? canonicalEntry.message
+          : undefined;
+      if (toolResult && !activeBranchAppend) {
+        throw new Error("Session transcript keyed tool result cannot change the selected branch");
+      }
       this.reloadPersistedTranscript();
-      // Context-excluded users have no payload in byId. The exact SQLite replay
-      // anchors their identity; physical ancestry still closes older turns.
-      if (this.resolveCurrentTurnEntryId() !== persistenceResult.adoptedMessageId) {
+      if (toolResult) {
+        this.ensureCompletePersistedHistory();
+        if (
+          !this.isCurrentToolResult(persistenceResult.adoptedMessageId, toolResult) ||
+          !this.persistenceTarget ||
+          !isDeepStrictEqual(
+            persistenceResult.anchor,
+            readAuthoritativeTranscriptEntryAnchor({
+              ...this.persistenceTarget,
+              entryId: persistenceResult.adoptedMessageId,
+            }),
+          )
+        ) {
+          throw new Error(
+            `Session transcript keyed tool result is outside the current group: ${persistenceResult.adoptedMessageId}`,
+          );
+        }
+      } else if (this.resolveCurrentTurnEntryId() !== persistenceResult.adoptedMessageId) {
+        // Context-excluded users have no payload in byId. The exact SQLite replay
+        // anchors their identity; physical ancestry still closes older turns.
         throw new Error(
           `Session transcript keyed user is outside the current turn: ${persistenceResult.adoptedMessageId}`,
         );
@@ -224,6 +250,36 @@ export class SessionManagerEntries extends SessionManagerPersistence {
     );
     error.name = "SqliteTranscriptMutationConflictError";
     return error;
+  }
+
+  private isCurrentToolResult(
+    entryId: string,
+    message: Extract<SessionMessageEntry["message"], { role: "toolResult" }>,
+  ): boolean {
+    if (this.appendParentId === null) {
+      return false;
+    }
+    let foundResult = false;
+    // Sibling parallel results may follow the canonical row, but a later
+    // assistant/user closes its group. Never move the append cursor backwards.
+    for (const parent of this.getBranch(this.appendParentId).toReversed()) {
+      if (parent.type === "message" && parent.message.role === "toolResult") {
+        foundResult ||= parent.id === entryId;
+      } else if (parent.type === "message" && parent.message.role === "assistant") {
+        return (
+          foundResult &&
+          parent.message.content.some(
+            (block) =>
+              block.type === "toolCall" &&
+              block.id === message.toolCallId &&
+              block.name === message.toolName,
+          )
+        );
+      } else if (!isSessionContextMetadataEntry(parent)) {
+        break;
+      }
+    }
+    return false;
   }
 
   resolveCurrentTurnEntryId(isInterruptedTail?: (entry: SessionEntry) => boolean): string | null {

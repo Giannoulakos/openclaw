@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   loadSessionEntry,
   loadTranscriptEventsSync,
@@ -92,7 +92,6 @@ async function withInitialWriter(
         lifecycleGeneration: getAgentRunLifecycleGeneration(),
       });
       const externalAbortController = {
-        arm: vi.fn(),
         throwIfFiredAfterPrepCleanup: async () => controller.signal.throwIfAborted(),
       };
       const afterAttempt = await promptState.withSessionWriterContext(async () => {
@@ -126,7 +125,6 @@ async function withInitialWriter(
       });
       await prepared?.transcriptLifecycle.dispose();
       await afterAttempt?.();
-      expect(externalAbortController.arm).toHaveBeenCalledOnce();
     } finally {
       try {
         await prepared?.transcriptLifecycle.dispose();

@@ -363,7 +363,9 @@ export function readPluginSdkSurfaceBudgets(env: NodeJS.ProcessEnv = process.env
       // -1: one exec policy object replaces two deprecated comparator exports.
       // +1: approved bounded TAR inspection through the archive admission owner.
       // +1: canonical runtime-context classifier for native history projection.
-      4447,
+      // +6: provider transcript commit params, result, and host capability types through
+      //     the focused agent-harness and agent-harness-runtime barrels.
+      4453,
       env,
     ),
     publicFunctionExports: readPluginSdkSurfaceBudgetEnv(
