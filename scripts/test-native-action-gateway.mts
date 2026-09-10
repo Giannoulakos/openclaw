@@ -38,6 +38,27 @@ const CASES = {
 } as const;
 type CaseID = keyof typeof CASES;
 type WireCase = { sessionKey: string; marker: string; message: string };
+const CONTROL_ACTIONS = [
+  "pair",
+  "revoke-acl",
+  "merge-profile",
+  "verify",
+  "complete",
+  "hold-response",
+  "wait-held",
+  "release-response",
+] as const;
+type ControlProgress = {
+  action: (typeof CONTROL_ACTIONS)[number] | "unknown";
+  phase:
+    | "body"
+    | "action"
+    | "connect-record"
+    | "identity"
+    | "pending-list"
+    | "pending-match"
+    | "approval";
+};
 export type NativeActionFixtureDescriptor = {
   version: 1;
   gatewayURL: string;
@@ -65,6 +86,7 @@ export async function withNativeActionGateway(
   platform: "ios" | "macos",
   executeNative: (descriptor: NativeActionFixtureDescriptor) => Promise<void>,
 ) {
+  let completedCases: CaseID[] = [];
   await runProfileWireProof(
     () => startQaMockOpenAiServer({ modelRefs: [MODEL_REF] }),
     async (fixture) => {
@@ -87,7 +109,7 @@ export async function withNativeActionGateway(
       const completed = new Set<CaseID>();
       const pairedDevices = new Set<string>();
       const pending = new Set<Promise<void>>();
-      const failures: unknown[] = [];
+      let firstControlFailure: Error | undefined;
       const cases = {} as Record<CaseID, WireCase>;
       const commands = new Map<CaseID, { sentinel: string; command: string }>();
       const caseKeys = Object.keys(CASES) as CaseID[];
@@ -169,23 +191,34 @@ export async function withNativeActionGateway(
         assert(response.ok, "proxy control failed");
         return await response.json();
       };
-      const handle = async (input: Record<string, unknown>): Promise<unknown> => {
+      const handle = async (
+        input: Record<string, unknown>,
+        progress: ControlProgress,
+      ): Promise<unknown> => {
+        progress.action = CONTROL_ACTIONS.find((action) => action === input.action) ?? "unknown";
+        progress.phase = "action";
         if (["hold-response", "wait-held", "release-response"].includes(String(input.action))) {
           return await proxyControl(input);
         }
         switch (input.action) {
           case "pair": {
+            progress.phase = "connect-record";
             const connection = proxy
               .snapshot()
               .events.findLast((event: { kind: string }) => event.kind === "connect-request");
-            assert.equal(connection?.clientId, `openclaw-${platform}`);
+            assert(connection, "native connect record was missing");
+            progress.phase = "identity";
+            assert.equal(connection.clientId, `openclaw-${platform}`);
             assert.equal(typeof connection.deviceId, "string");
             assert(connection.deviceId.length > 0, "native device identity was omitted");
+            progress.phase = "pending-list";
             const list = await admin.request<{
               pending: Array<{ requestId: string; deviceId: string }>;
             }>("device.pair.list", {});
+            progress.phase = "pending-match";
             const request = list.pending.find((entry) => entry.deviceId === connection.deviceId);
             assert(request, "native device did not enter real pairing");
+            progress.phase = "approval";
             await admin.request("device.pair.approve", { requestId: request.requestId });
             pairedDevices.add(connection.deviceId);
             return { paired: true };
@@ -230,6 +263,7 @@ export async function withNativeActionGateway(
         }
       };
       const control = createServer((request, response) => {
+        const progress: ControlProgress = { action: "unknown", phase: "body" };
         const task = (async () => {
           if (
             request.method !== "POST" ||
@@ -239,15 +273,29 @@ export async function withNativeActionGateway(
             response.writeHead(403).end();
             return;
           }
-          const result = await handle(await readBody(request));
+          const result = await handle(await readBody(request), progress);
           response.writeHead(200, { "content-type": "application/json" });
           response.end(JSON.stringify(result));
         })().catch((error: unknown) => {
-          failures.push(error);
+          if (!firstControlFailure) {
+            const category =
+              error instanceof assert.AssertionError
+                ? "assertion"
+                : error instanceof Error
+                  ? "error"
+                  : "non-error";
+            const message = `native fixture controls failed: action=${progress.action}; phase=${progress.phase}; reason=request-failed; category=${category}`;
+            // Raw assertions and stacks can contain fixture credentials and private paths.
+            firstControlFailure = new Error(message);
+            firstControlFailure.stack = message;
+          }
           response.writeHead(500).end("native fixture assertion failed");
         });
         pending.add(task);
-        void task.finally(() => pending.delete(task));
+        void task.then(
+          () => pending.delete(task),
+          () => pending.delete(task),
+        );
       });
       await runQaGatewayFixture(
         async () => {
@@ -322,10 +370,6 @@ export async function withNativeActionGateway(
           for (const [id, runId] of verified) {
             await verify(id, runId);
           }
-          assert.equal(failures.length, 0, "native fixture controls failed");
-          console.log(
-            JSON.stringify({ platform, cases: [...completed], finalEffectsVerified: true }),
-          );
         },
         () => proxy.stop(),
         async () => {
@@ -335,11 +379,20 @@ export async function withNativeActionGateway(
               control.close((error) => (error ? reject(error) : resolve()));
             });
           }
-          await Promise.all(pending);
+        },
+        async () => {
+          await Promise.allSettled(pending);
+        },
+        () => {
+          if (firstControlFailure) {
+            throw firstControlFailure;
+          }
         },
       );
+      completedCases = [...completed];
     },
   );
+  console.log(JSON.stringify({ platform, cases: completedCases, finalEffectsVerified: true }));
 }
 
 async function runNative(platform: "ios" | "macos", fixture: NativeActionFixtureDescriptor) {
