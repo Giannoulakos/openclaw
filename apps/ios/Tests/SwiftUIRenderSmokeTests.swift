@@ -14,7 +14,7 @@ struct SwiftUIRenderSmokeTests {
 
     private struct NativeChatHost: View {
         let presentation: NativeChatPresentation
-        let presentationID: UUID
+        let presentationID: UUID?
 
         var body: some View {
             ChatProTab(
@@ -228,16 +228,31 @@ struct SwiftUIRenderSmokeTests {
         try await Self.nativeChatFixture(action: "dictation-\(capturePhase)")
     }
 
+    @Test @MainActor func `unbound chat adopts a new session without native registration`() async throws {
+        try await Self.nativeChatFixture(action: "unbound-new-chat")
+    }
+
+    @Test @MainActor func `retired native chat ignores late session creation and releases its router`() async throws {
+        try await Self.nativeChatFixture(action: "retired-new-chat")
+    }
+
     @MainActor private static func nativeChatFixture(action: String) async throws {
+        weak var routerLifetime: NativeActionRouter?
         try await withUserDefaults([
             "talk.enabled": false, "talk.background.enabled": false, VoiceWakePreferences.enabledKey: false,
         ]) {
             let isDictation = action == "dictation-pending" || action == "dictation-reserved"
+            let isUnbound = action == "unbound-new-chat"
+            let retiresDuringCreate = action == "retired-new-chat"
             let session = OpenClawNativeSessionRef(
                 owner: .init(gatewayID: "chat-activation-\(UUID().uuidString)", profileID: "profile-b"),
                 agentID: "main",
                 sessionKey: "agent:main:native-b")
+            let expectedProfile = isUnbound ? nil : session.owner.profileID
             var createdProfiles: [String?] = []
+            var createdKeys: [String] = []
+            var historyKeys: Set<String> = []
+            var beforeCreateResponse: (@MainActor () -> Void)?
             var sentParams: [[String: Any]] = []
             var routingReads = 0
             let fixture = try await NativeGatewayWebSocketFixture.start(
@@ -256,7 +271,7 @@ struct SwiftUIRenderSmokeTests {
                         return .failure(code: "INVALID_REQUEST", message: "Missing method")
                     }
                     let profile = frame["expectedProfileId"] as? String
-                    #expect(profile == session.owner.profileID)
+                    #expect(profile == expectedProfile)
                     let params = frame["params"] as? [String: Any] ?? [:]
                     switch method {
                     case "users.self":
@@ -272,6 +287,7 @@ struct SwiftUIRenderSmokeTests {
                             Issue.record("Chat history request is missing its selected key")
                             return .failure(code: "INVALID_REQUEST", message: "Missing session key")
                         }
+                        historyKeys.insert(key)
                         return .success([
                             "sessionKey": key, "messages": [],
                             "sessionInfo": [
@@ -309,6 +325,9 @@ struct SwiftUIRenderSmokeTests {
                             Issue.record("New chat request is missing its key")
                             return .failure(code: "INVALID_REQUEST", message: "Missing session key")
                         }
+                        createdKeys.append(key)
+                        beforeCreateResponse?()
+                        beforeCreateResponse = nil
                         return .success(["ok": true, "key": key])
                     default:
                         Issue.record("Unexpected chat activation fixture method: \(method)")
@@ -320,6 +339,7 @@ struct SwiftUIRenderSmokeTests {
             let gateway = appModel.operatorSession
             let gatewayController = GatewayConnectionController(appModel: appModel, startDiscovery: false)
             let router = NativeActionRouter(appModel: appModel, gatewayController: gatewayController)
+            routerLifetime = router
             let presentation = NativeChatPresentation()
             let presentationID = router.registerPresentation { request, binding in
                 appModel.focusChatSession(request.session.sessionKey)
@@ -340,8 +360,10 @@ struct SwiftUIRenderSmokeTests {
                     releaseRestore?.resume()
                     releaseRestore = nil
                     appModel.testChatSessionRoutingRestoreHandler = nil
+                    beforeCreateResponse = nil
                     window?.isHidden = true
                     window?.rootViewController = nil
+                    window = nil
                     router.unregisterPresentation(presentationID)
                     appModel.setOperatorConnected(false)
                     appModel.activeGatewayConnectConfig = nil
@@ -367,7 +389,7 @@ struct SwiftUIRenderSmokeTests {
                 appModel.setOperatorConnected(true)
                 appModel.focusChatSession(session.sessionKey)
                 window = Self.host(
-                    NativeChatHost(presentation: presentation, presentationID: presentationID)
+                    NativeChatHost(presentation: presentation, presentationID: isUnbound ? nil : presentationID)
                         .environment(appModel)
                         .environment(router))
                 let restoreDeadline = ContinuousClock.now + .seconds(2)
@@ -376,10 +398,14 @@ struct SwiftUIRenderSmokeTests {
                 }
                 let release = try #require(releaseRestore)
 
-                let opening: OpenClawNativeOpenRequest = action == "reopen"
-                    ? .compose(session, draft: "retained idle text") : .session(session)
-                #expect(await router.open(opening) == .opened)
-                #expect(presentation.binding?.session == session)
+                if !isUnbound {
+                    let opening: OpenClawNativeOpenRequest = action == "reopen"
+                        ? .compose(session, draft: "retained idle text") : .session(session)
+                    #expect(await router.open(opening) == .opened)
+                    #expect(presentation.binding?.session == session)
+                } else {
+                    #expect(presentation.binding == nil)
+                }
                 releaseRestore = nil
                 release.resume()
                 let releaseDeadline = ContinuousClock.now + .seconds(2)
@@ -389,14 +415,42 @@ struct SwiftUIRenderSmokeTests {
                 try #require(restoreReturned)
                 try #require(createdProfiles.isEmpty)
                 #expect(restoreReturned)
-                if action == "new-chat" {
+                if action == "new-chat" || isUnbound || retiresDuringCreate {
+                    let prepared: OpenClawNativePreparedSend? = if retiresDuringCreate {
+                        try await router.prepareSend(to: session, message: "retired confirmation")
+                    } else { nil }
+                    if retiresDuringCreate {
+                        beforeCreateResponse = {
+                            // Retire while sessions.create is in flight, before the fixture sends its reply.
+                            router.unregisterPresentation(presentationID)
+                            window?.isHidden = true
+                            window?.rootViewController = nil
+                            window = nil
+                        }
+                    }
                     // A's suspended restore cannot consume the native command.
                     appModel.requestNewChat()
                     let commandDeadline = ContinuousClock.now + .seconds(2)
-                    while createdProfiles.isEmpty, ContinuousClock.now < commandDeadline {
+                    while ContinuousClock.now < commandDeadline {
+                        if retiresDuringCreate {
+                            if createdKeys.contains(where: { historyKeys.contains($0) }) { break }
+                        } else if appModel.chatSessionKey != session.sessionKey {
+                            break
+                        }
                         try await Task.sleep(for: .milliseconds(10))
                     }
-                    #expect(createdProfiles == [session.owner.profileID])
+                    let createdKey = try #require(createdKeys.first)
+                    #expect(createdProfiles == [expectedProfile])
+                    if let prepared {
+                        // The retained confirmation keeps the real model alive until its post-create
+                        // history proves adoption finished. Its callback must not refocus the app.
+                        try #require(historyKeys.contains(createdKey))
+                        #expect(appModel.chatSessionKey == session.sessionKey)
+                        await #expect(throws: Error.self) { try await prepared.submit() }
+                        #expect(sentParams.isEmpty)
+                    } else {
+                        #expect(appModel.chatSessionKey == createdKey)
+                    }
                 } else if isDictation {
                     let reserved = action == "dictation-reserved"
                     let originalBinding = try #require(presentation.binding)
@@ -495,6 +549,14 @@ struct SwiftUIRenderSmokeTests {
             }
             await gateway.disconnect()
             await appModel.purgeChatTranscriptCache(gatewayID: session.owner.gatewayID)
+        }
+        if action == "retired-new-chat" {
+            // Hosting, registration, restore, and prepared-send references have left scope.
+            let deadline = ContinuousClock.now + .seconds(2)
+            while routerLifetime != nil, ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            #expect(routerLifetime == nil)
         }
     }
 
