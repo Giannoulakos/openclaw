@@ -31,7 +31,6 @@ struct NativeActionIntentsTests {
         omittedOperation.target = target
         omittedOperation.operation = nil
         omittedOperation.draft = draft
-        try #require(omittedOperation.operation == nil)
         _ = try await omittedOperation.perform()
         try #require(host.requests == [.session(session), .session(session), .session(session)])
 
