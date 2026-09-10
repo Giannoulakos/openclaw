@@ -52,7 +52,7 @@ export type NativeActionFixtureDescriptor = {
 async function readBody(request: AsyncIterable<Buffer | string>) {
   let text = "";
   for await (const chunk of request) {
-    text += chunk;
+    text += chunk.toString();
     assert(text.length <= 8192, "native fixture control body exceeded limit");
   }
   const input: unknown = JSON.parse(text);
@@ -256,7 +256,10 @@ export async function withNativeActionGateway(
               id === "aclSuspended" ? "acl" : id === "profileSuspended" ? "profile" : id;
             let sessionKey = groups.get(group);
             if (!sessionKey) {
-              sessionKey = await fixture.createSession(`native-${platform}-${group}`, "bob");
+              sessionKey = await fixture.createSession(
+                `native-${platform}-${group.toLowerCase()}`,
+                "bob",
+              );
               groups.set(group, sessionKey);
             }
             const marker = `NATIVE-${platform.toUpperCase()}-${id.toUpperCase()}`;
