@@ -29,11 +29,13 @@ import type {
   RestartRecoveryParams,
   RestartRecoveryResult,
 } from "./subagent-registry-restart-recovery-types.js";
+import { inspectSubagentTaskOwnership } from "./subagent-task-ownership.js";
 
 const MAX_RECOVERY_ATTEMPTS = 2;
 const RECOVERY_ATTEMPT_WINDOW_MS = 2 * 60_000;
 const MAX_INTERRUPTION_AGE_MS = 2 * 60 * 60_000;
 const TERMINAL_RESUMPTION_NOTICE_RETRY_WINDOW_MS = 2 * 60_000;
+const ownershipDiagnosticEntries = new WeakSet<object>();
 export type { RestartRecoveryParams, RestartRecoveryResult };
 
 export async function recoverInterruptedSubagentRow(
@@ -45,6 +47,22 @@ export async function recoverInterruptedSubagentRow(
   const childSessionKey = params.entry.childSessionKey.trim();
   if (!childSessionKey) {
     return { status: "ignored" };
+  }
+  const taskOwnership = inspectSubagentTaskOwnership({
+    entry: params.entry,
+    backingPolicy: "failure-finalization",
+  });
+  if (taskOwnership.kind === "invalid") {
+    if (!ownershipDiagnosticEntries.has(params.entry)) {
+      ownershipDiagnosticEntries.add(params.entry);
+      params.warn("subagent restart recovery is waiting for authoritative task ownership", {
+        runId: params.runId,
+        childSessionKey,
+        reason: taskOwnership.reason,
+        action: "inspect the subagent and task records before retrying the subagent request",
+      });
+    }
+    return { status: "deferred" };
   }
   const pendingNotice = params.entry.resumptionNotice;
   if (pendingNotice) {

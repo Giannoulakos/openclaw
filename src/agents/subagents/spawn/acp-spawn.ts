@@ -630,6 +630,7 @@ export async function spawnAcpDirect(
         runTimeoutSeconds,
         expectsCompletionMessage,
         spawnMode,
+        taskRowOwnership: "gateway_best_effort",
       };
     },
   });

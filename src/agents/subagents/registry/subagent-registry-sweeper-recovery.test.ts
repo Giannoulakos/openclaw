@@ -12,7 +12,7 @@ const recoverRow = vi.hoisted(() => vi.fn());
 const getAgentRunContext = vi.hoisted(() => vi.fn<(_runId: string) => unknown>(() => undefined));
 const removeInternalSessionEffectsSession = vi.hoisted(() => vi.fn(async () => {}));
 const detachedTaskRuntime = vi.hoisted(() => ({
-  finalizeTaskRunByRunId: vi.fn(() => [] as unknown[]),
+  finalizeSubagentTaskRunForOwner: vi.fn(() => [] as unknown[]),
   findDetachedTaskRun: vi.fn(() => undefined as unknown),
 }));
 const killRuntime = vi.hoisted(() => ({
@@ -43,7 +43,10 @@ vi.mock("../../../infra/agent-run-registry.js", async (importOriginal) => ({
 vi.mock("../../internal-session-effects.js", () => ({
   removeInternalSessionEffectsSession,
 }));
-vi.mock("../../../tasks/detached-task-runtime.js", () => detachedTaskRuntime);
+vi.mock("../../../tasks/detached-task-runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../../tasks/detached-task-runtime.js")>()),
+  ...detachedTaskRuntime,
+}));
 vi.mock("./subagent-control.runtime.js", () => killRuntime);
 vi.mock("./subagent-session-reconciliation.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./subagent-session-reconciliation.js")>();
@@ -173,7 +176,7 @@ describe("subagent registry recovery scheduling", () => {
       lifecycleRevision: "session-revision",
       updatedAt: Date.now(),
     };
-    detachedTaskRuntime.finalizeTaskRunByRunId.mockReset().mockReturnValue([]);
+    detachedTaskRuntime.finalizeSubagentTaskRunForOwner.mockReset().mockReturnValue([]);
     detachedTaskRuntime.findDetachedTaskRun.mockReset().mockReturnValue(undefined);
     removeInternalSessionEffectsSession.mockReset();
   });
@@ -498,7 +501,7 @@ describe("subagent registry recovery scheduling", () => {
         createdAt: entry.createdAt,
       },
     });
-    detachedTaskRuntime.finalizeTaskRunByRunId.mockReturnValue([
+    detachedTaskRuntime.finalizeSubagentTaskRunForOwner.mockReturnValue([
       {
         runId: entry.runId,
         runtime: "subagent",
@@ -527,7 +530,7 @@ describe("subagent registry recovery scheduling", () => {
     expect(killRuntime.abortEmbeddedAgentRun).not.toHaveBeenCalled();
     expect(killRuntime.clearSessionQueues).not.toHaveBeenCalled();
     expect(completeSubagentRunWithRecovery).not.toHaveBeenCalled();
-    expect(detachedTaskRuntime.finalizeTaskRunByRunId).toHaveBeenCalledWith(
+    expect(detachedTaskRuntime.finalizeSubagentTaskRunForOwner).toHaveBeenCalledWith(
       expect.objectContaining({
         runId: entry.runId,
         status: "cancelled",
@@ -577,7 +580,7 @@ describe("subagent registry recovery scheduling", () => {
       }),
     ).resolves.toBe(true);
 
-    expect(detachedTaskRuntime.finalizeTaskRunByRunId).toHaveBeenCalledWith(
+    expect(detachedTaskRuntime.finalizeSubagentTaskRunForOwner).toHaveBeenCalledWith(
       expect.objectContaining({
         runId: entry.runId,
         status: "cancelled",

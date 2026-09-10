@@ -17,9 +17,10 @@ import {
   type OpenClawStateDatabase,
 } from "../../../state/openclaw-state-db.js";
 import { ensureTaskRegistryReady, getTaskById } from "../../../tasks/runtime-internal.js";
+import { loadTaskFlowRegistryStateFromSqlite } from "../../../tasks/task-flow-registry.store.sqlite.js";
+import { getTaskFlowById } from "../../../tasks/task-flow-runtime-internal.js";
 import { publishTaskRecordAfterAtomicStore } from "../../../tasks/task-registry.js";
 import type { TaskRecord } from "../../../tasks/task-registry.types.js";
-import { resetTaskRegistryForTests } from "../../../tasks/task-runtime.test-helpers.js";
 import { withEnvAsync } from "../../../test-utils/env.js";
 import { suspendPendingFinalDelivery } from "../registry/subagent-registry-lifecycle-cleanup.js";
 import { SubagentLifecycleController } from "../registry/subagent-registry-lifecycle.js";
@@ -33,8 +34,10 @@ import {
 } from "./subagent-completion-admission.store.js";
 import {
   armRequesterWake,
+  createCoreRequiredCompletionOwner,
   failedRecords,
   records,
+  resetCompletionTaskStateForTests,
   requesterWakeDriver,
 } from "./subagent-completion-admission.test-helpers.js";
 import {
@@ -63,7 +66,7 @@ describe("atomic subagent completion admission store", () => {
 
   afterEach(() => {
     subagentRuns.clear();
-    resetTaskRegistryForTests({ persist: false });
+    resetCompletionTaskStateForTests();
     closeOpenClawStateDatabaseForTest();
     vi.unstubAllEnvs();
   });
@@ -108,7 +111,7 @@ describe("atomic subagent completion admission store", () => {
   function resetOwners(): void {
     clearRows();
     subagentRuns.clear();
-    resetTaskRegistryForTests({ persist: false });
+    resetCompletionTaskStateForTests();
     database = openOpenClawStateDatabase({ path: path.join(tempDir, "state.sqlite") });
   }
 
@@ -121,7 +124,7 @@ describe("atomic subagent completion admission store", () => {
   function reopenOwners() {
     closeOpenClawStateDatabaseForTest();
     subagentRuns.clear();
-    resetTaskRegistryForTests({ persist: false });
+    resetCompletionTaskStateForTests();
     database = openOpenClawStateDatabase();
     for (const [runId, entry] of loadSubagentRegistryFromSqlite()) {
       subagentRuns.set(runId, entry);
@@ -139,7 +142,7 @@ describe("atomic subagent completion admission store", () => {
     "durably settles a rejected $name wake without rewriting the child outcome",
     async ({ status, outcome }) => {
       useDefaultDatabase();
-      const input = persistOwner(failedRecords(status, outcome));
+      const input = persistOwner(createCoreRequiredCompletionOwner(failedRecords(status, outcome)));
       const originalTask = structuredClone(input.task);
       const originalExecution = structuredClone(input.subagent.execution);
       const driver = requesterWakeDriver([input]);
@@ -175,6 +178,9 @@ describe("atomic subagent completion admission store", () => {
           endedAt: originalTask.endedAt,
         });
         expect(getTaskById(input.task.taskId)?.terminalOutcome).toBeUndefined();
+        expect(getTaskFlowById(input.task.parentFlowId!)).toEqual(
+          loadTaskFlowRegistryStateFromSqlite().flows.get(input.task.parentFlowId!),
+        );
 
         const deliver = vi.fn(async () => {});
         await expect(
@@ -739,7 +745,7 @@ describe("atomic subagent completion admission store", () => {
       });
 
       await releaseSessionDeliveryClaim(second.id);
-      resetTaskRegistryForTests({ persist: false });
+      resetCompletionTaskStateForTests();
       subagentRuns.clear();
       closeOpenClawStateDatabaseForTest();
       database = openOpenClawStateDatabase();
@@ -858,7 +864,7 @@ describe("atomic subagent completion admission store", () => {
         .prepare("UPDATE schema_meta SET app_version = ? WHERE meta_key = 'primary'")
         .run("2026.7.0");
 
-      resetTaskRegistryForTests({ persist: false });
+      resetCompletionTaskStateForTests();
       subagentRuns.clear();
       closeOpenClawStateDatabaseForTest();
       database = openOpenClawStateDatabase();
@@ -1024,7 +1030,7 @@ describe("atomic subagent completion admission store", () => {
       });
       expect(subagentRuns.get(input.subagent.runId)?.cleanupCompletedAt).toBeTypeOf("number");
 
-      resetTaskRegistryForTests({ persist: false });
+      resetCompletionTaskStateForTests();
       subagentRuns.clear();
       for (const [runId, entry] of loadSubagentRegistryFromSqlite()) {
         subagentRuns.set(runId, entry);
