@@ -528,7 +528,7 @@ describe("Code Mode agent-loop error recovery", () => {
       return createCurrentTurnDeliveryTool(delivery, owner);
     };
     const reply = createReply(generation.signal);
-    const executeReply = reply.execute.bind(reply);
+    const executeReply = reply.execute;
     vi.spyOn(reply, "execute").mockImplementation(async (...args) => {
       try {
         return await executeReply(...args);
