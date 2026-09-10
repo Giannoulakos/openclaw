@@ -280,7 +280,29 @@ describe("Gateway automatic Workshop learning", () => {
               reviewStarted.promise,
               45_000,
               "The idle Workshop review did not reach the provider.",
-            );
+            ).catch((cause: unknown) => {
+              const summarizeError = (error: unknown) =>
+                String(error).replaceAll(state.root, "<test-state>").slice(0, 300);
+              let outcomes: unknown;
+              try {
+                outcomes = Object.values(readSkillReviewOutcomes().experienceReviews)
+                  .slice(0, 3)
+                  .map(({ outcome, error }) => ({
+                    outcome,
+                    ...(error ? { error: summarizeError(error) } : {}),
+                  }));
+              } catch (error) {
+                outcomes = { readError: summarizeError(error) };
+              }
+              throw new Error(
+                `The idle Workshop review did not reach the provider. ${JSON.stringify({
+                  foregroundRequests,
+                  reviewRequests: reviewRequests.length,
+                  outcomes,
+                })}`,
+                { cause },
+              );
+            });
             let continuedTranscript: typeof originalTranscript;
             try {
               const laterAccepted = await gateway.client.request<{ runId: string; status: string }>(
