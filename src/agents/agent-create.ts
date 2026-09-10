@@ -20,7 +20,10 @@ import type { OptionalBootstrapFileName } from "../config/types.agent-defaults.j
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { FsSafeError, root } from "../infra/fs-safe.js";
 import { normalizeAgentId, normalizeAgentIdStrict } from "../routing/session-key.js";
-import { readAgentDeletionJournal } from "../state/agent-deletion-journal.js";
+import {
+  readAgentDeletionJournal,
+  runWithAgentCreationClaim,
+} from "../state/agent-deletion-journal.js";
 import { recordAgentProvenance, type AgentCreatedVia } from "../state/agent-provenance.js";
 import { isReservedSystemAgentId } from "../system-agent/agent-id.js";
 import { resolveUserPath } from "../utils.js";
@@ -265,6 +268,10 @@ export async function createAgent(params: CreateAgentParams): Promise<CreateAgen
   }
   const agentId = validation.agentId;
   const isBootstrapMain = agentId === BOOTSTRAP_AGENT_ID && params.bootstrapMain === true;
+  // Staged auth for a recreated identity must open that identity's databases beneath its
+  // completed deletion record. The scope covers only the receipt, so early exits never hold it.
+  const withCreationClaim = <T>(run: () => Promise<T>) =>
+    runWithAgentCreationClaim({ agentId }, run);
 
   const template = params.role ? await loadAgentRole(params.role) : undefined;
   const safeName = sanitizeAgentIdentityLine(rawName);
@@ -501,7 +508,9 @@ export async function createAgent(params: CreateAgentParams): Promise<CreateAgen
           }
           // The receipt owns compensation until the config transform publishes this result.
           params.beforePersistentApply?.();
-          const preparedReceipt = await params.prepareConfigCommit?.();
+          const preparedReceipt = await withCreationClaim(
+            async () => await params.prepareConfigCommit?.(),
+          );
           configCommitReceipt = preparedReceipt ? preparedReceipt : undefined;
 
           return {
@@ -532,7 +541,7 @@ export async function createAgent(params: CreateAgentParams): Promise<CreateAgen
           : {}),
       };
       params.onCommitted?.(result);
-      await committedReceipt?.commit();
+      await withCreationClaim(async () => await committedReceipt?.commit());
       if (
         deletion?.cleanupCompleted &&
         !tombstoneClaimed &&
@@ -548,8 +557,9 @@ export async function createAgent(params: CreateAgentParams): Promise<CreateAgen
     });
   } catch (error) {
     if (configCommitReceipt) {
+      const stagedReceipt = configCommitReceipt;
       try {
-        await configCommitReceipt.rollback();
+        await withCreationClaim(async () => await stagedReceipt.rollback());
       } catch (rollbackError) {
         throw new Error(
           `${String(error)}\nstaged config rollback failed: ${String(rollbackError)}`,
