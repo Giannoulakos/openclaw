@@ -7,6 +7,7 @@ import {
 // Discord tests cover message utils plugin behavior.
 import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { installDiscordEndpointRuntime, type DiscordEndpointLease } from "../endpoint-runtime.js";
 import type { Message } from "../internal/discord.js";
 
 const readRemoteMediaBuffer = vi.fn();
@@ -49,12 +50,17 @@ vi.mock("openclaw/plugin-sdk/runtime-env", async () => {
 
 let resolveForwardedMediaList: typeof import("./message-media.js").resolveForwardedMediaList;
 let resolveMediaList: typeof import("./message-media.js").resolveMediaList;
+let endpointLease: DiscordEndpointLease | undefined;
 
 beforeAll(async () => {
   ({ resolveForwardedMediaList, resolveMediaList } = await import("./message-media.js"));
 });
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  endpointLease?.close();
+  endpointLease = undefined;
+  vi.restoreAllMocks();
+});
 beforeEach(() => vi.resetAllMocks());
 
 function asMessage(payload: Record<string, unknown>): Message {
@@ -89,6 +95,14 @@ function mockDownload(path: string, options: { buffer?: string; contentType?: st
     contentType,
   });
   saveMediaBuffer.mockResolvedValueOnce({ path, contentType });
+}
+
+function installMediaEndpoint(): void {
+  endpointLease = installDiscordEndpointRuntime({
+    restApiBaseUrl: "http://127.0.0.1:43210/api/v10",
+    gatewayBotUrl: "http://127.0.0.1:43210/api/v10/gateway/bot",
+    gatewayOrigin: "ws://127.0.0.1:43210",
+  });
 }
 
 const DISCORD_CDN_HOSTNAMES = [
@@ -304,6 +318,37 @@ describe("resolveForwardedMediaList", () => {
 });
 
 describe("resolveMediaList", () => {
+  it("downloads media from the configured endpoint origin without redirects", async () => {
+    installMediaEndpoint();
+    mockDownload("/tmp/provider-media.png");
+    const attachment = attachmentFixture("provider-media", "provider-media.png", {
+      url: "http://127.0.0.1:43210/media/provider-media.png",
+    });
+
+    const result = await resolveMediaList(asMessage({ attachments: [attachment] }), 512);
+
+    expect(result[0]?.path).toBe("/tmp/provider-media.png");
+    expect(fetchParams()).toEqual(
+      expect.objectContaining({
+        url: "http://127.0.0.1:43210/media/provider-media.png",
+        maxRedirects: 0,
+        ssrfPolicy: expect.objectContaining({
+          allowedOrigins: ["http://127.0.0.1:43210"],
+        }),
+      }),
+    );
+  });
+
+  it("rejects public Discord CDN media before the downloader is called", async () => {
+    installMediaEndpoint();
+    const attachment = attachmentFixture("public-media", "public-media.png");
+
+    const result = await resolveMediaList(asMessage({ attachments: [attachment] }), 512);
+
+    expect(readRemoteMediaBuffer).not.toHaveBeenCalled();
+    expect(result).toEqual([{ contentType: "image/png" }]);
+  });
+
   it("downloads stickers", async () => {
     const sticker = stickerFixture("sticker-2", "hello");
     mockDownload("/tmp/sticker-2.png", { buffer: "sticker" });

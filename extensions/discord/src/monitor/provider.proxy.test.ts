@@ -1,5 +1,6 @@
 // Discord tests cover provider.proxy plugin behavior.
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import type { DiscordEndpointLease } from "../endpoint-runtime.js";
 
 function createGatewayInfoBody(overrides?: {
   url?: string;
@@ -178,7 +179,8 @@ vi.mock("openclaw/plugin-sdk/proxy-capture", () => ({
   resolveDebugProxySettings: resolveDebugProxySettingsMock,
 }));
 
-vi.mock("openclaw/plugin-sdk/ssrf-runtime", () => ({
+vi.mock("openclaw/plugin-sdk/ssrf-runtime", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("openclaw/plugin-sdk/ssrf-runtime")>()),
   fetchWithSsrFGuard: fetchWithSsrFGuardMock,
 }));
 
@@ -196,10 +198,13 @@ describe("createDiscordGatewayPlugin", () => {
   ] as const;
   let createDiscordGatewayPlugin: typeof import("./gateway-plugin.js").createDiscordGatewayPlugin;
   let waitForDiscordGatewayPluginRegistration: typeof import("./gateway-plugin.js").waitForDiscordGatewayPluginRegistration;
+  let installDiscordEndpointRuntime: typeof import("../endpoint-runtime.js").installDiscordEndpointRuntime;
+  let endpointLease: DiscordEndpointLease | undefined;
 
   beforeAll(async () => {
     ({ createDiscordGatewayPlugin, waitForDiscordGatewayPluginRegistration } =
       await import("./gateway-plugin.js"));
+    ({ installDiscordEndpointRuntime } = await import("../endpoint-runtime.js"));
   });
 
   function createRuntime() {
@@ -358,6 +363,8 @@ describe("createDiscordGatewayPlugin", () => {
   });
 
   afterEach(() => {
+    endpointLease?.close();
+    endpointLease = undefined;
     vi.useRealTimers();
     vi.unstubAllEnvs();
   });
@@ -381,6 +388,76 @@ describe("createDiscordGatewayPlugin", () => {
     expect(fetchInit?.headers).toEqual({ Authorization: "Bot token-123" });
     expect(fetchInit?.signal).toBeInstanceOf(AbortSignal);
     expect(baseRegisterClientSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps metadata, initial sockets, and resume sockets on the configured endpoint", async () => {
+    endpointLease = installDiscordEndpointRuntime({
+      restApiBaseUrl: "http://127.0.0.1:43210/api/v10",
+      gatewayBotUrl: "http://127.0.0.1:43210/api/v10/gateway/bot",
+      gatewayOrigin: "ws://127.0.0.1:43210",
+    });
+    globalFetchMock.mockResolvedValue(
+      new Response(createGatewayInfoBody({ url: "ws://127.0.0.1:43210/gateway" }), {
+        status: 200,
+      }),
+    );
+    const plugin = createDiscordGatewayPlugin({ discordConfig: {}, runtime: createRuntime() });
+
+    await registerGatewayClient(plugin);
+    const createWebSocket = (plugin as unknown as { createWebSocket: (url: string) => unknown })
+      .createWebSocket;
+    createWebSocket("ws://127.0.0.1:43210/gateway?v=10");
+    createWebSocket("ws://127.0.0.1:43210/gateway?resume=1");
+
+    expect(firstMockArg(globalFetchMock, "globalFetchMock")).toBe(
+      "http://127.0.0.1:43210/api/v10/gateway/bot",
+    );
+    expect(webSocketSpy.mock.calls.map(([url]) => url)).toEqual([
+      "ws://127.0.0.1:43210/gateway?v=10",
+      "ws://127.0.0.1:43210/gateway?resume=1",
+    ]);
+    expect(() => createWebSocket("wss://gateway.discord.gg/?v=10")).toThrow(
+      /outside the configured WebSocket origin/,
+    );
+    expect(httpsAgentSpy).not.toHaveBeenCalled();
+  });
+
+  it("rejects reconnect sockets retained after the endpoint lease is replaced", () => {
+    const retiredLease = installDiscordEndpointRuntime({
+      restApiBaseUrl: "http://127.0.0.1:43210/api/v10",
+      gatewayBotUrl: "http://127.0.0.1:43210/api/v10/gateway/bot",
+      gatewayOrigin: "ws://127.0.0.1:43210",
+    });
+    const plugin = createDiscordGatewayPlugin({ discordConfig: {}, runtime: createRuntime() });
+    const createWebSocket = (plugin as unknown as { createWebSocket: (url: string) => unknown })
+      .createWebSocket;
+
+    retiredLease.close();
+    endpointLease = installDiscordEndpointRuntime({
+      restApiBaseUrl: "http://127.0.0.1:43211/api/v10",
+      gatewayBotUrl: "http://127.0.0.1:43211/api/v10/gateway/bot",
+      gatewayOrigin: "ws://127.0.0.1:43211",
+    });
+
+    expect(() => createWebSocket("ws://127.0.0.1:43210/gateway?resume=1")).toThrow(
+      /lease has been retired/,
+    );
+    expect(webSocketSpy).not.toHaveBeenCalled();
+  });
+
+  it("does not fall back to public Gateway metadata in endpoint mode", async () => {
+    endpointLease = installDiscordEndpointRuntime({
+      restApiBaseUrl: "http://127.0.0.1:43210/api/v10",
+      gatewayBotUrl: "http://127.0.0.1:43210/api/v10/gateway/bot",
+      gatewayOrigin: "ws://127.0.0.1:43210",
+    });
+    globalFetchMock.mockResolvedValue(new Response("provider unavailable", { status: 503 }));
+    const plugin = createDiscordGatewayPlugin({ discordConfig: {}, runtime: createRuntime() });
+
+    await expect(registerGatewayClient(plugin)).rejects.toThrow(
+      "Failed to get gateway information from Discord",
+    );
+    expect((plugin as unknown as { gatewayInfo?: unknown }).gatewayInfo).toBeUndefined();
   });
 
   it("uses ws for gateway sockets even without proxy", () => {

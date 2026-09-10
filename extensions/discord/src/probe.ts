@@ -5,6 +5,7 @@ import { resolveFetch } from "openclaw/plugin-sdk/fetch-runtime";
 import { readResponseWithLimit } from "openclaw/plugin-sdk/response-limit-runtime";
 import { fetchWithTimeout, runChannelProbe } from "openclaw/plugin-sdk/text-utility-runtime";
 import { DiscordApiError, fetchDiscord } from "./api.js";
+import { getDiscordEndpointRuntime } from "./endpoint-runtime.js";
 import { normalizeDiscordToken } from "./token.js";
 
 const DISCORD_API_BASE = "https://discord.com/api/v10";
@@ -55,10 +56,11 @@ async function fetchDiscordApplicationMe(
     if (!normalized) {
       return undefined;
     }
+    const endpoint = getDiscordEndpointRuntime();
     return await fetchDiscord<{ id?: string; flags?: number }>(
       "/oauth2/applications/@me",
       normalized,
-      fetcher,
+      endpoint?.fetch ?? fetcher,
       { retry: { attempts: 1 }, timeoutMs },
     );
   } catch {
@@ -151,7 +153,8 @@ export async function probeDiscord(
   return await runChannelProbe(
     undefined,
     async ({ startedAt }) => {
-      const fetcher = opts?.fetcher ?? fetch;
+      const endpoint = getDiscordEndpointRuntime();
+      const fetcher = endpoint?.fetch ?? opts?.fetcher ?? fetch;
       const includeApplication = opts?.includeApplication === true;
       const normalized = normalizeDiscordToken(token, "channels.discord.token");
       const result: Omit<DiscordProbe, "elapsedMs"> = {
@@ -164,7 +167,7 @@ export async function probeDiscord(
       }
       let res: Response | undefined;
       try {
-        const getMeUrl = `${DISCORD_API_BASE}/users/@me`;
+        const getMeUrl = `${endpoint?.descriptor.restApiBaseUrl ?? DISCORD_API_BASE}/users/@me`;
         const getMeDeadlineMs = Date.now() + timeoutMs;
         res = await fetchWithTimeout(
           getMeUrl,
@@ -253,10 +256,11 @@ export async function probeDiscordApplicationId(
     return { kind: "resolved", applicationId: parsedApplicationId };
   }
   try {
+    const endpoint = getDiscordEndpointRuntime();
     const json = await fetchDiscord<{ id?: string }>(
       "/oauth2/applications/@me",
       normalized,
-      fetcher,
+      endpoint?.fetch ?? fetcher,
       { timeoutMs },
     );
     if (json?.id) {

@@ -12,6 +12,7 @@ import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runti
 import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import { chunkDiscordTextWithMode } from "./chunk.js";
 import { resolveDiscordClientAccountContext } from "./client.js";
+import { getDiscordEndpointRuntime } from "./endpoint-runtime.js";
 import {
   DiscordError,
   RateLimitError,
@@ -131,8 +132,10 @@ export async function sendWebhookMessageDiscord(
     });
   }
 
+  const endpoint = getDiscordEndpointRuntime();
+  const restApiBaseUrl = endpoint?.descriptor.restApiBaseUrl ?? "https://discord.com/api/v10";
   const url = new URL(
-    `https://discord.com/api/v10/webhooks/${encodeURIComponent(webhookId)}/${encodeURIComponent(webhookToken)}`,
+    `${restApiBaseUrl}/webhooks/${encodeURIComponent(webhookId)}/${encodeURIComponent(webhookToken)}`,
   );
   url.searchParams.set("wait", opts.wait === false ? "false" : "true");
   if (opts.threadId != null && opts.threadId !== "") {
@@ -153,7 +156,7 @@ export async function sendWebhookMessageDiscord(
         async () => {
           await opts.onPlatformSendDispatch?.();
           opts.assertPlatformSendAuthorized?.();
-          const attemptResponse = await (proxyFetch ?? fetch)(url.toString(), {
+          const attemptResponse = await (endpoint?.fetch ?? proxyFetch ?? fetch)(url.toString(), {
             method: "POST",
             headers: {
               "content-type": "application/json",

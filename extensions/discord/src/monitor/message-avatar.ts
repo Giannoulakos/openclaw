@@ -1,6 +1,7 @@
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { logDebug } from "openclaw/plugin-sdk/logging-core";
 import { saveRemoteMedia } from "openclaw/plugin-sdk/media-runtime";
+import { resolveDiscordEndpointMediaGuard } from "../endpoint-runtime.js";
 import type { Client, User } from "../internal/discord.js";
 import { resolveDiscordCdnPolicy } from "./media-ssrf-policy.js";
 
@@ -46,12 +47,20 @@ export function createDiscordAvatarResolver() {
     if (pending.has(key) || pending.size >= DISCORD_AVATAR_CACHE_MAX_ENTRIES) {
       return undefined;
     }
+    let endpointGuard: ReturnType<typeof resolveDiscordEndpointMediaGuard>;
+    try {
+      endpointGuard = resolveDiscordEndpointMediaGuard(url);
+    } catch (error) {
+      logDebug(`discord conversation avatar download blocked: ${formatErrorMessage(error)}`);
+      return undefined;
+    }
     pending.add(key);
     void saveRemoteMedia({
       url,
       filePathHint: "conversation-avatar.png",
       maxBytes: DISCORD_AVATAR_MAX_BYTES,
-      ssrfPolicy: resolveDiscordCdnPolicy(),
+      ssrfPolicy: endpointGuard?.ssrfPolicy ?? resolveDiscordCdnPolicy(),
+      ...(endpointGuard ? { maxRedirects: endpointGuard.maxRedirects } : {}),
     })
       .then((media) => {
         setBoundedEntry(saved, key, media.path);

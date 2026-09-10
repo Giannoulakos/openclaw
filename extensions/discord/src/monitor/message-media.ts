@@ -13,6 +13,7 @@ import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { resolveDiscordEndpointMediaGuard } from "../endpoint-runtime.js";
 import type { Message } from "../internal/discord.js";
 import { resolveDiscordCdnPolicy } from "./media-ssrf-policy.js";
 import {
@@ -268,6 +269,7 @@ async function fetchDiscordMedia(params: {
   fallbackContentType?: string;
   originalFilename?: string;
 }) {
+  const endpointGuard = resolveDiscordEndpointMediaGuard(params.url);
   const timeoutAbortController = params.totalTimeoutMs ? new AbortController() : undefined;
   const signal =
     params.abortSignal && timeoutAbortController
@@ -280,7 +282,8 @@ async function fetchDiscordMedia(params: {
     filePathHint: params.filePathHint,
     maxBytes: params.maxBytes,
     fetchImpl: params.fetchImpl,
-    ssrfPolicy: params.ssrfPolicy,
+    ssrfPolicy: endpointGuard?.ssrfPolicy ?? params.ssrfPolicy,
+    ...(endpointGuard ? { maxRedirects: endpointGuard.maxRedirects } : {}),
     readIdleTimeoutMs: params.readIdleTimeoutMs,
     fallbackContentType: params.fallbackContentType,
     originalFilename: params.originalFilename,
