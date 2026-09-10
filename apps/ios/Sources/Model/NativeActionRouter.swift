@@ -85,6 +85,10 @@ final class NativeActionRouter: OpenClawNativeActionHost {
             switch request {
             case let .compose(_, draft):
                 if let draft {
+                    guard !self.appModel.isChatDictationPending, !self.appModel.isChatDictationActive else {
+                        throw OpenClawNativeActionError(
+                            "Finish or cancel dictation before composing another message.")
+                    }
                     let chat = presented.chat
                     guard chat.input.isEmpty, chat.replyTarget == nil,
                           !chat.hasDraftToSend, !chat.isAttachmentOwnerPinned
