@@ -64,6 +64,8 @@ describe("subagent registry restart recovery", () => {
           sessionKey: childSessionKey,
           expectedExistingSessionId: "session-id",
         }),
+        undefined,
+        { assertAdmissionCurrent: expect.any(Function) },
       );
       expect(mocks.entries[childSessionKey]).toMatchObject({
         sessionId: "session-id",
@@ -230,6 +232,8 @@ describe("subagent registry restart recovery", () => {
           suppressPromptPersistence: true,
           message: expect.stringContaining("latest user direction"),
         }),
+        undefined,
+        { assertAdmissionCurrent: expect.any(Function) },
       );
       expect(String(dispatchAgent.mock.calls[0]?.[0].message).includes("already applied")).toBe(
         configChanged,
