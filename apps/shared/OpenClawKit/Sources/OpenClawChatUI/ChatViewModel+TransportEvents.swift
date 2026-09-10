@@ -25,6 +25,8 @@ extension OpenClawChatViewModel {
     func handleTransportEvent(_ evt: OpenClawChatTransportEvent) {
         guard !self.isTransportDetached else { return }
         switch evt {
+        case let .routeUnavailable(reason):
+            self.detachTransport(reason: reason)
         case let .health(ok):
             let reconnected = ok && !self.healthOK
             applyTransportHealth(ok)

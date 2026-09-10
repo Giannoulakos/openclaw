@@ -148,7 +148,7 @@ extension IOSGatewayChatTransport {
               await self.gateway.supportsServerMethod(method, ifCurrentRoute: route) == true
         else { return .unavailable }
         do {
-            let data = try await self.gateway.request(
+            let data = try await self.requestChatGateway(
                 request,
                 ifCurrentRoute: route,
                 distinguishPreDispatchRouteChange: true)
@@ -270,11 +270,7 @@ extension IOSGatewayChatTransport {
         idempotencyKey: String,
         attachments: [OpenClawChatAttachmentPayload]) async throws -> OpenClawChatSendResponse
     {
-        let route: GatewayNodeSessionRoute? = if let outboxGatewayID {
-            await self.gateway.currentRoute(ifGatewayID: outboxGatewayID)
-        } else {
-            await self.gateway.currentRoute()
-        }
+        let route = await self.currentSessionMutationRoute()
         guard let route,
               let supportsRoutingContract = await gateway.supportsServerCapability(
                   .chatSendRoutingContract,
@@ -308,10 +304,11 @@ extension IOSGatewayChatTransport {
         ifCurrentRoute expectedRoute: GatewayNodeSessionRoute?,
         distinguishPreDispatchRouteChange: Bool = false) async throws -> OpenClawChatSendResponse
     {
-        let supportsSettingsCAS = if let expectedRoute {
+        let requestRoute = expectedRoute ?? self.nativeBinding?.route
+        let supportsSettingsCAS = if let requestRoute {
             await self.gateway.supportsServerCapability(
                 .sessionSettingsCAS,
-                ifCurrentRoute: expectedRoute) == true
+                ifCurrentRoute: requestRoute) == true
         } else {
             false
         }
@@ -335,9 +332,9 @@ extension IOSGatewayChatTransport {
             idempotencyKey: idempotencyKey,
             attachments: attachments)
         do {
-            let res = try await gateway.request(
+            let res = try await self.requestChatGateway(
                 request,
-                ifCurrentRoute: expectedRoute,
+                ifCurrentRoute: requestRoute,
                 distinguishPreDispatchRouteChange: distinguishPreDispatchRouteChange)
             let decoded = try JSONDecoder().decode(OpenClawChatSendResponse.self, from: res)
             Self.logger.info("chat.send ok runId=\(decoded.runId, privacy: .public)")

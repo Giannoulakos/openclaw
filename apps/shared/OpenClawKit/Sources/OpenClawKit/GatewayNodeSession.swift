@@ -684,6 +684,16 @@ public actor GatewayNodeSession {
             socketGeneration: socketGeneration)
     }
 
+    public func admittedHTTPContext(
+        ifCurrentRoute route: GatewayNodeSessionRoute) async -> GatewayAdmittedHTTPContext?
+    {
+        guard self.isCurrentRoute(route), let channel = self.channel else { return nil }
+        let context = await channel.admittedHTTPContext(
+            ifCurrentConnectionGeneration: route.socketGeneration)
+        guard self.isCurrentRoute(route), self.channel === channel else { return nil }
+        return context
+    }
+
     /// Private app-worker context from the authenticated socket, never configured fallback routes.
     public func workerConnectionData(ifCurrentRoute route: GatewayNodeSessionRoute) async -> Data? {
         guard self.isCurrentRoute(route), let channel, let url = self.activeURL,
@@ -806,7 +816,8 @@ public actor GatewayNodeSession {
         paramsJSON: String?,
         timeoutSeconds: Int = 15,
         ifCurrentRoute expectedRoute: GatewayNodeSessionRoute? = nil,
-        distinguishPreDispatchRouteChange: Bool = false) async throws -> Data
+        distinguishPreDispatchRouteChange: Bool = false,
+        expectedProfileId: String? = nil) async throws -> Data
     {
         let params = try decodeParamsJSON(paramsJSON)
         return try await self.request(
@@ -814,7 +825,8 @@ public actor GatewayNodeSession {
             params: params,
             timeoutMs: Double(timeoutSeconds * 1000),
             ifCurrentRoute: expectedRoute,
-            distinguishPreDispatchRouteChange: distinguishPreDispatchRouteChange)
+            distinguishPreDispatchRouteChange: distinguishPreDispatchRouteChange,
+            expectedProfileId: expectedProfileId)
     }
 
     public func request(
@@ -822,7 +834,8 @@ public actor GatewayNodeSession {
         params: [String: AnyCodable]?,
         timeoutMs: Double = 15000,
         ifCurrentRoute expectedRoute: GatewayNodeSessionRoute? = nil,
-        distinguishPreDispatchRouteChange: Bool = false) async throws -> Data
+        distinguishPreDispatchRouteChange: Bool = false,
+        expectedProfileId: String? = nil) async throws -> Data
     {
         if let expectedRoute, !self.isCurrentRoute(expectedRoute) {
             if distinguishPreDispatchRouteChange {
@@ -843,7 +856,8 @@ public actor GatewayNodeSession {
                     method: method,
                     params: params,
                     timeoutMs: timeoutMs,
-                    ifCurrentConnectionGeneration: expectedRoute.socketGeneration))
+                    ifCurrentConnectionGeneration: expectedRoute.socketGeneration,
+                    expectedProfileId: expectedProfileId))
             } catch {
                 result = .failure(error)
             }
@@ -857,7 +871,8 @@ public actor GatewayNodeSession {
         return try await channel.request(
             method: method,
             params: params,
-            timeoutMs: timeoutMs)
+            timeoutMs: timeoutMs,
+            expectedProfileId: expectedProfileId)
     }
 
     public func subscribeServerEvents(bufferingNewest: Int = 200) -> AsyncStream<EventFrame> {

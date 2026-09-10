@@ -1,3 +1,4 @@
+import Observation
 import OpenClawKit
 import SwiftUI
 import Testing
@@ -6,6 +7,22 @@ import UIKit
 @testable import OpenClawChatUI
 
 struct SwiftUIRenderSmokeTests {
+    @MainActor @Observable
+    fileprivate final class NativeChatPresentation {
+        var binding: IOSNativeActionBinding?
+    }
+
+    private struct NativeChatHost: View {
+        let presentation: NativeChatPresentation
+        let presentationID: UUID
+
+        var body: some View {
+            ChatProTab(
+                nativeBinding: self.presentation.binding,
+                nativePresentationID: self.presentationID)
+        }
+    }
+
     @MainActor private static func host(_ view: some View, size: CGSize? = nil) -> UIWindow {
         let frame = CGRect(origin: .zero, size: size ?? UIScreen.main.bounds.size)
         let window = UIWindow(frame: frame)
@@ -199,6 +216,160 @@ struct SwiftUIRenderSmokeTests {
         }
 
         #expect(requestedArtifactId == artifactId)
+    }
+
+    @Test @MainActor func `native chat survives a suspended ordinary activation and owns new chat`() async throws {
+        try await withUserDefaults(["talk.enabled": false, "talk.background.enabled": false]) {
+            let session = OpenClawNativeSessionRef(
+                owner: .init(gatewayID: "chat-activation-\(UUID().uuidString)", profileID: "profile-b"),
+                agentID: "main",
+                sessionKey: "agent:main:native-b")
+            var createdProfiles: [String?] = []
+            let fixture = try await NativeGatewayWebSocketFixture.start(
+                issuedDeviceTokens: [],
+                hello: .init(
+                    role: "operator",
+                    scopes: ["operator.read", "operator.write"],
+                    capabilities: [GatewayServerCapability.profileBinding.rawValue]),
+                rpcHandler: { frame in
+                    guard let method = frame["method"] as? String else {
+                        Issue.record("Chat activation fixture received a request without a method")
+                        return .failure(code: "INVALID_REQUEST", message: "Missing method")
+                    }
+                    let profile = frame["expectedProfileId"] as? String
+                    #expect(profile == session.owner.profileID)
+                    let params = frame["params"] as? [String: Any] ?? [:]
+                    switch method {
+                    case "users.self":
+                        return .success(["profile": ["id": session.owner.profileID]])
+                    case "chat.history":
+                        guard let key = params["sessionKey"] as? String else {
+                            Issue.record("Chat history request is missing its selected key")
+                            return .failure(code: "INVALID_REQUEST", message: "Missing session key")
+                        }
+                        return .success([
+                            "sessionKey": key, "messages": [],
+                            "sessionInfo": ["key": key, "agentId": session.agentID],
+                        ])
+                    case "sessions.messages.subscribe":
+                        guard let key = params["key"] as? String else {
+                            Issue.record("Chat subscription is missing its selected key")
+                            return .failure(code: "INVALID_REQUEST", message: "Missing session key")
+                        }
+                        return .success(["subscribed": true, "key": key])
+                    case "health":
+                        return .success(["ok": true])
+                    case "sessions.list":
+                        return .success(["ts": 0, "count": 0, "sessions": []])
+                    case "models.list":
+                        return .success(["models": []])
+                    case "commands.list":
+                        return .success(["commands": []])
+                    case "chat.metadata":
+                        return .success(["swarmEnabled": false])
+                    case "tasks.list":
+                        return .success(["tasks": []])
+                    case "sessions.create":
+                        createdProfiles.append(profile)
+                        guard let key = params["key"] as? String else {
+                            Issue.record("New chat request is missing its key")
+                            return .failure(code: "INVALID_REQUEST", message: "Missing session key")
+                        }
+                        return .success(["ok": true, "key": key])
+                    default:
+                        Issue.record("Unexpected chat activation fixture method: \(method)")
+                        return .failure(code: "INVALID_REQUEST", message: "Unexpected fixture method: \(method)")
+                    }
+                })
+            defer { fixture.stop() }
+            let appModel = NodeAppModel(audioAdmissionInitiallyAllowed: false)
+            let gateway = appModel.operatorSession
+            let gatewayController = GatewayConnectionController(appModel: appModel, startDiscovery: false)
+            let router = NativeActionRouter(appModel: appModel, gatewayController: gatewayController)
+            let presentation = NativeChatPresentation()
+            let presentationID = router.registerPresentation { request, binding in
+                appModel.focusChatSession(request.session.sessionKey)
+                presentation.binding = binding
+            }
+            var releaseRestore: CheckedContinuation<Void, Never>?
+            var restoreReturned = false
+            appModel.testChatSessionRoutingRestoreHandler = {
+                await withCheckedContinuation { releaseRestore = $0 }
+                restoreReturned = true
+            }
+            var options = GatewayWebSocketTestSupport.identityFreeOperatorConnectOptions
+            options.deviceAuthGatewayID = session.owner.gatewayID
+            options.allowStoredDeviceAuth = false
+            var window: UIWindow?
+            do {
+                defer {
+                    releaseRestore?.resume()
+                    releaseRestore = nil
+                    appModel.testChatSessionRoutingRestoreHandler = nil
+                    window?.isHidden = true
+                    window?.rootViewController = nil
+                    router.unregisterPresentation(presentationID)
+                    appModel.setOperatorConnected(false)
+                    appModel.activeGatewayConnectConfig = nil
+                    appModel.voiceWake.stop()
+                }
+                try await gateway.connect(
+                    url: fixture.url(),
+                    credentials: .init(),
+                    connectOptions: options,
+                    sessionBox: nil,
+                    onConnected: {},
+                    onDisconnected: { _ in },
+                    onInvoke: { BridgeInvokeResponse(id: $0.id, ok: true) })
+                appModel.activeGatewayConnectConfig = GatewayConnectConfig(
+                    url: fixture.url(),
+                    stableID: session.owner.gatewayID,
+                    tls: nil,
+                    token: nil,
+                    bootstrapToken: nil,
+                    password: nil,
+                    nodeOptions: options)
+                appModel.connectedGatewayID = session.owner.gatewayID
+                appModel.setOperatorConnected(true)
+                appModel.focusChatSession(session.sessionKey)
+                window = Self.host(
+                    NativeChatHost(presentation: presentation, presentationID: presentationID)
+                        .environment(appModel)
+                        .environment(router))
+                let restoreDeadline = ContinuousClock.now + .seconds(2)
+                while releaseRestore == nil, ContinuousClock.now < restoreDeadline {
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                let release = try #require(releaseRestore)
+
+                #expect(await router.open(.session(session)) == .opened)
+                #expect(presentation.binding?.session == session)
+                releaseRestore = nil
+                release.resume()
+                let releaseDeadline = ContinuousClock.now + .seconds(2)
+                while !restoreReturned, ContinuousClock.now < releaseDeadline {
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                try #require(restoreReturned)
+                try #require(createdProfiles.isEmpty)
+                // Let A's restore return before queuing the command so an early B
+                // consumption cannot hide a stale A continuation.
+                appModel.requestNewChat()
+                let commandDeadline = ContinuousClock.now + .seconds(2)
+                while createdProfiles.isEmpty, ContinuousClock.now < commandDeadline {
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+
+                #expect(restoreReturned)
+                #expect(createdProfiles == [session.owner.profileID])
+            } catch {
+                await gateway.disconnect()
+                await appModel.purgeChatTranscriptCache(gatewayID: session.owner.gatewayID)
+                throw error
+            }
+            await gateway.disconnect()
+            await appModel.purgeChatTranscriptCache(gatewayID: session.owner.gatewayID)
+        }
     }
 
     @Test @MainActor func `streaming assistant bubble builds mixed prose and code`() {

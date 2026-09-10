@@ -106,6 +106,7 @@ struct IOSGatewayChatTransportTests {
         let id: String
         let method: String
         let params: [String: AnyCodable]
+        let expectedProfileId: String?
     }
 
     private actor RequestRecorder {
@@ -124,6 +125,9 @@ struct IOSGatewayChatTransportTests {
 
     private func withSessionTransport(
         unreadAckAdvertisement: Bool? = true,
+        gatewayID: String? = nil,
+        capabilities: [String] = [],
+        nativeProfileID: String? = nil,
         _ run: (IOSGatewayChatTransport, RequestRecorder) async throws -> Void) async throws
     {
         let recorder = RequestRecorder()
@@ -139,6 +143,14 @@ struct IOSGatewayChatTransportTests {
                 let payload = switch request.method {
                 case "agents.list": GatewayWebSocketTestSupport.agentCatalogPayload
                 case "sessions.create": #"{"key":"forked"}"#
+                case "health": #"{"ok":true}"#
+                case "chat.history":
+                    """
+                    {"sessionKey":"agent:reviewer:main","messages":[],
+                     "sessionInfo":{"key":"agent:reviewer:main","agentId":"reviewer"}}
+                    """
+                case "chat.send": #"{"runId":"submitted-run","status":"started"}"#
+                case "sessions.messages.subscribe": #"{"subscribed":true,"key":"agent:reviewer:main"}"#
                 default: #"{"entry":{}}"#
                 }
                 socket.emitReceiveSuccess(.data(Data(
@@ -148,7 +160,8 @@ struct IOSGatewayChatTransportTests {
                 let hello = GatewayWebSocketTestSupport.connectOkData(
                     id: socket.snapshotConnectRequestID() ?? "connect",
                     methods: ["agents.list", "sessions.patch", "sessions.delete", "sessions.create"],
-                    capabilities: unreadAckAdvertisement == true ? ["session-unread-ack-contract"] : [])
+                    capabilities: capabilities +
+                        (unreadAckAdvertisement == true ? ["session-unread-ack-contract"] : []))
                 guard unreadAckAdvertisement == nil else { return .data(hello) }
                 var frame = try #require(JSONSerialization.jsonObject(with: hello) as? [String: Any])
                 var payload = try #require(frame["payload"] as? [String: Any])
@@ -162,6 +175,7 @@ struct IOSGatewayChatTransportTests {
         let gateway = GatewayNodeSession()
         var options = GatewayWebSocketTestSupport.identityFreeOperatorConnectOptions
         options.allowStoredDeviceAuth = false
+        options.deviceAuthGatewayID = gatewayID
         do {
             try await gateway.connect(
                 url: #require(URL(string: "ws://session-transport-test.invalid")),
@@ -171,11 +185,58 @@ struct IOSGatewayChatTransportTests {
                 onConnected: {},
                 onDisconnected: { _ in },
                 onInvoke: { BridgeInvokeResponse(id: $0.id, ok: true) })
-            try await run(IOSGatewayChatTransport(gateway: gateway, globalAgentId: " Reviewer "), recorder)
+            let binding: IOSNativeActionBinding?
+            if let nativeProfileID {
+                let ownerID = try #require(gatewayID)
+                binding = try IOSNativeActionBinding(
+                    session: OpenClawNativeSessionRef(
+                        owner: .init(gatewayID: ownerID, profileID: nativeProfileID),
+                        agentID: "reviewer",
+                        sessionKey: "agent:reviewer:main"),
+                    gateway: gateway,
+                    route: #require(await gateway.currentRoute(ifGatewayID: ownerID)))
+            } else {
+                binding = nil
+            }
+            try await run(IOSGatewayChatTransport(
+                gateway: gateway,
+                globalAgentId: " Reviewer ",
+                outboxGatewayID: gatewayID,
+                nativeBinding: binding), recorder)
             await gateway.disconnect()
         } catch {
             await gateway.disconnect()
             throw error
+        }
+    }
+
+    @Test(arguments: [false, true])
+    func `native send lease retains actual CAS support and refuses a retired socket`(supportsCAS: Bool) async throws {
+        try await self.withSessionTransport(
+            gatewayID: "gateway-a",
+            capabilities: ["chat-send-routing-contract"] + (supportsCAS ? ["session-settings-cas-v1"] : []))
+        { transport, recorder in
+            let captured = try #require(await transport.gateway.currentRoute(ifGatewayID: "gateway-a"))
+            guard case let .available(lease) = await transport.acquireOutboxRouteLease(ifCurrentRoute: captured) else {
+                Issue.record("Expected a lease from the selected socket")
+                return
+            }
+            #expect(lease.supportsSessionSettingsCAS == supportsCAS)
+            await transport.gateway.disconnect()
+            guard case .unavailable = await transport.acquireOutboxRouteLease(ifCurrentRoute: captured) else {
+                Issue.record("A retired socket must not acquire a successor lease")
+                return
+            }
+            await #expect(throws: Error.self) {
+                try await lease.sendMessage(
+                    sessionKey: "agent:reviewer:main",
+                    agentID: "reviewer",
+                    message: "intentional message",
+                    thinking: "auto",
+                    idempotencyKey: "test-invocation",
+                    attachments: [])
+            }
+            #expect(await recorder.all().map(\.method) == ["agents.list"])
         }
     }
 
@@ -838,6 +899,107 @@ struct IOSGatewayChatTransportTests {
             stateversion: nil)
         let mapped = OpenClawChatGatewayPayloadCodec.event(from: frame)
         #expect(mapped == nil)
+    }
+}
+
+extension IOSGatewayChatTransportTests {
+    @Test(arguments: [nil, "profile-e\u{301}", "profile-\u{E9}"] as [String?])
+    func `native chat forwards one exact profile through reads subscriptions and the existing send lease`(
+        profileID: String?) async throws
+    {
+        try await self.withSessionTransport(
+            gatewayID: "gateway-a",
+            capabilities: ["profile-binding-v1", "chat-send-routing-contract"],
+            nativeProfileID: profileID)
+        { transport, recorder in
+            let history = try await transport.requestHistory(sessionKey: "agent:reviewer:main")
+            #expect(history.sessionInfo?.key == "agent:reviewer:main")
+            #expect(try await transport.requestHealth(timeoutMs: 250))
+            try await transport.setActiveSessionKey("agent:reviewer:main")
+            guard case let .available(lease) = await transport.acquireOutboxRouteLease() else {
+                Issue.record("Expected the current transport's canonical send lease")
+                return
+            }
+            let sent = try await lease.sendMessage(
+                sessionKey: "agent:reviewer:main",
+                agentID: "reviewer",
+                message: "intentional message",
+                thinking: "auto",
+                idempotencyKey: "native-invocation",
+                attachments: [])
+            #expect(sent.runId == "submitted-run")
+            let requests = await recorder.all()
+            #expect(requests.map(\.method) == [
+                "chat.history", "health", "sessions.messages.subscribe", "agents.list", "chat.send",
+            ])
+            for request in requests {
+                #expect(request.expectedProfileId.map { Array($0.utf8) } == profileID.map { Array($0.utf8) })
+                #expect(request.params["expectedProfileId"] == nil)
+            }
+            await transport.gateway.disconnect()
+            await #expect(throws: Error.self) {
+                _ = try await transport.requestHistory(sessionKey: "agent:reviewer:main")
+            }
+            #expect(await recorder.all().count == requests.count)
+        }
+    }
+
+    @Test func `native chat without binding capability reports unavailable before any RPC`() async throws {
+        try await self.withSessionTransport(
+            gatewayID: "gateway-a",
+            nativeProfileID: "profile-a")
+        { transport, recorder in
+            await #expect(throws: OpenClawNativeActionError.self) {
+                _ = try await transport.requestHealth(timeoutMs: 250)
+            }
+            let event = try await AsyncTimeout.withTimeout(
+                seconds: 2,
+                onTimeout: { URLError(.timedOut) },
+                operation: {
+                    var iterator = transport.events().makeAsyncIterator()
+                    return await iterator.next()
+                })
+            guard case let .routeUnavailable(reason) = event else {
+                Issue.record("Missing profile binding must visibly detach the native transport")
+                return
+            }
+            #expect(reason.contains("Update the selected Gateway"))
+            #expect(await recorder.all().isEmpty)
+        }
+    }
+
+    @Test func `native history rejects a different canonical session before presentation`() async throws {
+        try await self.withSessionTransport(
+            gatewayID: "gateway-a",
+            capabilities: ["profile-binding-v1"],
+            nativeProfileID: "profile-a")
+        { transport, recorder in
+            await #expect(throws: OpenClawNativeActionError.self) {
+                _ = try await transport.requestHistory(sessionKey: "agent:reviewer:other")
+            }
+            #expect(await recorder.all().map(\.method) == ["chat.history"])
+        }
+    }
+
+    @Test(arguments: ["profile-e\u{301}", "profile-\u{E9}", nil] as [String?])
+    func `native event admission requires exact recipient and captured socket`(recipient: String?) async throws {
+        try await self.withSessionTransport(
+            gatewayID: "gateway-a",
+            capabilities: ["profile-binding-v1"],
+            nativeProfileID: "profile-e\u{301}")
+        { transport, _ in
+            let binding = try #require(transport.nativeBinding)
+            let frame = EventFrame(
+                type: "event",
+                event: "session.message",
+                payload: AnyCodable(["sessionKey": "agent:reviewer:main"]),
+                seq: 1,
+                stateversion: nil,
+                recipientprofileid: recipient)
+            #expect(await binding.accepts(frame) == (recipient?.utf8.elementsEqual("profile-e\u{301}".utf8) == true))
+            await transport.gateway.disconnect()
+            #expect(await binding.accepts(frame) == false)
+        }
     }
 }
 

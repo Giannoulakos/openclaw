@@ -1,4 +1,5 @@
 import Foundation
+import OpenClawChatUI
 import OpenClawProtocol
 import Testing
 @testable import OpenClawKit
@@ -763,6 +764,12 @@ private func nodeInvokePush(id: String, command: String) -> GatewayPush {
 
 @Suite(.serialized)
 struct GatewayNodeSessionTests {
+    enum RequestEncoding: CaseIterable, Sendable {
+        case json
+        case params
+        case chat
+    }
+
     @Test func `authenticated invoke metadata reaches the native dispatcher unchanged`() async throws {
         let gateway = GatewayNodeSession()
         let capture = StringCapture()
@@ -2107,9 +2114,11 @@ struct GatewayNodeSessionTests {
         await gateway.disconnect()
     }
 
-    @Test
-    func `upgrade request carries sanitized custom headers read per connect`() async throws {
-        let session = FakeGatewayWebSocketSession()
+    @Test(arguments: [nil, String(repeating: "ab", count: 32)] as [String?])
+    func `upgrade request carries sanitized custom headers read per connect`(
+        reportedFingerprint: String?) async throws
+    {
+        let session = FakeGatewayWebSocketSession(effectiveTLSFingerprintSHA256: reportedFingerprint)
         let gateway = GatewayNodeSession()
         let secret = MutableHeaderValue(value: "first-secret")
         let options = nodeConnectOptions()
@@ -2135,16 +2144,90 @@ struct GatewayNodeSessionTests {
         #expect(request.value(forHTTPHeaderField: "CF-Access-Client-Id") == "client-id")
         #expect(request.value(forHTTPHeaderField: "CF-Access-Client-Secret") == "first-secret")
         #expect(request.value(forHTTPHeaderField: "Host") == nil)
+        let route = try #require(await gateway.currentRoute())
+        // A custom transport's session-wide metadata is not an admitted task decision.
+        #expect(await gateway.admittedHTTPContext(ifCurrentRoute: route) == nil)
+        #expect(secret.readCount() == 1)
 
         // Header edits must ride the next upgrade without re-pairing or a new channel identity.
         secret.set("second-secret")
         await gateway.disconnect()
+        #expect(await gateway.admittedHTTPContext(ifCurrentRoute: route) == nil)
         try await connectOnce()
         let reconnectRequest = try #require(session.latestRequest())
         #expect(reconnectRequest.value(forHTTPHeaderField: "CF-Access-Client-Secret") == "second-secret")
 
         await gateway.disconnect()
     }
+
+    #if os(macOS)
+    @Test
+    @MainActor
+    func `admitted HTTP context retains upgrade headers and retires with the physical socket`() async throws {
+        let identity = try NativeGatewayTLSIdentity()
+        let fixture = try await NativeGatewayWebSocketFixture.start(
+            issuedDeviceTokens: [nil, nil],
+            tlsIdentity: identity.identity)
+        defer { fixture.stop() }
+        let session = GatewayTLSPinningSession(
+            params: .init(
+                required: true, expectedFingerprint: identity.fingerprint, allowTOFU: false, storeKey: nil),
+            allowsRedirects: false,
+            allowsStoredCredentials: false)
+        defer { session.finishTasksAndInvalidate() }
+        let secret = MutableHeaderValue(value: "first-secret")
+        let gateway = GatewayNodeSession()
+        let url = fixture.url().appendingPathComponent("gateway/mount")
+        let connect = {
+            try await gateway.connect(
+                url: url,
+                connectOptions: nodeConnectOptions(allowStoredDeviceAuth: false),
+                sessionBox: WebSocketSessionBox(session: session),
+                extraHeadersProvider: {
+                    ["CF-Access-Client-Secret": secret.get(), "Host": "untrusted.example"]
+                },
+                onConnected: {},
+                onDisconnected: { _ in },
+                onInvoke: { BridgeInvokeResponse(id: $0.id, ok: true) })
+        }
+        do {
+            try await connect()
+            let firstRoute = try #require(await gateway.currentRoute())
+            let first = try #require(await gateway.admittedHTTPContext(ifCurrentRoute: firstRoute))
+            #expect(first.gatewayURL == url)
+            #expect(first.tlsFingerprintSHA256 == identity.fingerprint)
+            #expect(first.customHeaders == ["CF-Access-Client-Secret": "first-secret"])
+            #expect(fixture.capturedUpgradeHeader("CF-Access-Client-Secret", at: 0) == "first-secret")
+            #expect(secret.readCount() == 1)
+
+            secret.set("second-secret")
+            try await connect()
+            let unchanged = try #require(await gateway.admittedHTTPContext(ifCurrentRoute: firstRoute))
+            #expect(unchanged.customHeaders == first.customHeaders)
+            #expect(secret.readCount() == 1)
+
+            fixture.closeConnection(at: 0)
+            try await waitUntil("replacement socket admitted") {
+                guard let route = await gateway.currentRoute(), route != firstRoute else { return false }
+                return await gateway.admittedHTTPContext(ifCurrentRoute: route) != nil
+            }
+            let nextRoute = try #require(await gateway.currentRoute())
+            let next = try #require(await gateway.admittedHTTPContext(ifCurrentRoute: nextRoute))
+            #expect(await gateway.admittedHTTPContext(ifCurrentRoute: firstRoute) == nil)
+            #expect(next.gatewayURL == url)
+            #expect(next.tlsFingerprintSHA256 == identity.fingerprint)
+            #expect(next.customHeaders == ["CF-Access-Client-Secret": "second-secret"])
+            #expect(fixture.capturedUpgradeHeader("CF-Access-Client-Secret", at: 1) == "second-secret")
+            #expect(first.customHeaders == ["CF-Access-Client-Secret": "first-secret"])
+            #expect(secret.readCount() == 2)
+            await gateway.disconnect()
+            #expect(await gateway.admittedHTTPContext(ifCurrentRoute: nextRoute) == nil)
+        } catch {
+            await gateway.disconnect()
+            throw error
+        }
+    }
+    #endif
 
     @Test
     func `cleartext upgrade never reads or attaches custom headers`() async throws {
@@ -2165,14 +2248,16 @@ struct GatewayNodeSessionTests {
         await gateway.disconnect()
     }
 
-    @Test
-    func `server methods stay bound to the connected route`() async throws {
-        let session = FakeGatewayWebSocketSession(helloMethods: [
-            "approval.get",
-            "approval.resolve",
-            "exec.approval.get",
-            "exec.approval.resolve",
-        ])
+    @Test(arguments: [false, true])
+    func `server methods and capabilities stay bound to the connected route`(profileBinding: Bool) async throws {
+        let session = FakeGatewayWebSocketSession(
+            helloMethods: [
+                "approval.get",
+                "approval.resolve",
+                "exec.approval.get",
+                "exec.approval.resolve",
+            ],
+            helloCapabilities: profileBinding ? ["profile-binding-v1"] : [])
         let gateway = GatewayNodeSession()
         let options = operatorConnectOptions(scopes: [], clientMode: "operator")
 
@@ -2180,9 +2265,100 @@ struct GatewayNodeSessionTests {
         let route = try #require(await gateway.currentRoute())
         #expect(await gateway.supportsServerMethod("approval.get", ifCurrentRoute: route) == true)
         #expect(await gateway.supportsServerMethod("missing", ifCurrentRoute: route) == false)
+        #expect(await gateway.supportsServerCapability(.profileBinding, ifCurrentRoute: route) == profileBinding)
 
         await gateway.disconnect()
         #expect(await gateway.supportsServerMethod("approval.get", ifCurrentRoute: route) == nil)
+        #expect(await gateway.supportsServerCapability(.profileBinding, ifCurrentRoute: route) == nil)
+    }
+
+    @Test(arguments: RequestEncoding.allCases, [false, true])
+    func `requests preserve per request profile bytes without binding later requests`(
+        encoding: RequestEncoding,
+        captureRoute: Bool) async throws
+    {
+        let session = FakeGatewayWebSocketSession()
+        let gateway = GatewayNodeSession()
+        try await gateway.connectForTest(
+            testURL("ws://gateway.example.invalid"),
+            options: operatorConnectOptions(),
+            session: session)
+        do {
+            let currentRoute = try #require(await gateway.currentRoute())
+            let route = captureRoute ? currentRoute : nil
+            let socket = try #require(session.latestTask())
+            let profiles: [String?] = [nil, " Profile-\u{00E9} ", " Profile-e\u{0301} ", nil]
+            for (index, profile) in profiles.enumerated() {
+                let pending = Task {
+                    switch encoding {
+                    case .json:
+                        try await gateway.request(
+                            method: "chat.history",
+                            paramsJSON: #"{"sessionKey":"agent:main:main"}"#,
+                            ifCurrentRoute: route,
+                            expectedProfileId: profile)
+                    case .params:
+                        try await gateway.request(
+                            method: "chat.history",
+                            params: ["sessionKey": OpenClawKit.AnyCodable("agent:main:main")],
+                            ifCurrentRoute: route,
+                            expectedProfileId: profile)
+                    case .chat:
+                        try await gateway.request(
+                            OpenClawChatGatewayRequest(
+                                method: "chat.history",
+                                params: ["sessionKey": OpenClawKit.AnyCodable("agent:main:main")],
+                                timeoutMs: 15000),
+                            ifCurrentRoute: route,
+                            expectedProfileId: profile)
+                    }
+                }
+                defer { pending.cancel() }
+                try await waitUntil("profile request sent") {
+                    socket.sentRequestCount(method: "chat.history") == index + 1
+                }
+                let frame = try #require(socket.sentRequests(method: "chat.history").last)
+                let expectedKeys: Set<String> = profile == nil
+                    ? ["type", "id", "method", "params"]
+                    : ["type", "id", "method", "params", "expectedProfileId"]
+                #expect(Set(frame.keys) == expectedKeys)
+                if let profile {
+                    let encodedProfile = try #require(frame["expectedProfileId"] as? String)
+                    #expect(Array(encodedProfile.utf8) == Array(profile.utf8))
+                }
+                let params = try #require(frame["params"] as? [String: String])
+                #expect(params == ["sessionKey": "agent:main:main"])
+                let execution = profile == nil ? nil : (index == 1 ? "not_started" : "may_have_executed")
+                try socket.emitResponse(
+                    id: #require(frame["id"] as? String),
+                    payload: ["messages": []],
+                    error: execution.map { execution in
+                        [
+                            "code": "INVALID_REQUEST",
+                            "message": "Selected profile is no longer active",
+                            "details": [
+                                "reason": "EXPECTED_PROFILE_MISMATCH",
+                                "execution": execution,
+                            ],
+                        ]
+                    })
+                do {
+                    let result = try await pending.value
+                    #expect(execution == nil)
+                    let payload = try #require(JSONSerialization.jsonObject(with: result) as? [String: Any])
+                    #expect((payload["messages"] as? [Any])?.isEmpty == true)
+                } catch let error as GatewayResponseError {
+                    #expect(execution != nil)
+                    #expect(error.details["reason"]?.stringValue == "EXPECTED_PROFILE_MISMATCH")
+                    #expect(error.details["execution"]?.stringValue == execution)
+                }
+            }
+            #expect(session.snapshotMakeCount() == 1)
+        } catch {
+            await gateway.disconnect()
+            throw error
+        }
+        await gateway.disconnect()
     }
 
     @Test
@@ -2309,8 +2485,8 @@ struct GatewayNodeSessionTests {
         await gateway.disconnect()
     }
 
-    @Test
-    func `captured route bound operations never use a replacement channel`() async throws {
+    @Test(arguments: [String?.none, "profile-a"])
+    func `captured route bound operations never use a replacement channel`(expectedProfileId: String?) async throws {
         let session = FakeGatewayWebSocketSession()
         let gateway = GatewayNodeSession()
         let composedGatewayID = "gw-\u{00E9}"
@@ -2344,7 +2520,8 @@ struct GatewayNodeSessionTests {
             _ = try await gateway.request(
                 method: "approval.get",
                 paramsJSON: "{}",
-                ifCurrentRoute: firstRoute)
+                ifCurrentRoute: firstRoute,
+                expectedProfileId: expectedProfileId)
             Issue.record("stale route request unexpectedly reached the replacement channel")
         } catch is CancellationError {
             // Expected: the route lease belongs to the first channel.
@@ -2354,7 +2531,8 @@ struct GatewayNodeSessionTests {
                 method: "approval.get",
                 paramsJSON: "{}",
                 ifCurrentRoute: firstRoute,
-                distinguishPreDispatchRouteChange: true)
+                distinguishPreDispatchRouteChange: true,
+                expectedProfileId: expectedProfileId)
             Issue.record("typed stale route request unexpectedly reached the replacement channel")
         } catch is GatewayNodeSessionRequestError {
             // Expected: callers can distinguish a request rejected before dispatch.
