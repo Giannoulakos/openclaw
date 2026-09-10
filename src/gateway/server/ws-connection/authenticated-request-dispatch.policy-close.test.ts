@@ -59,14 +59,17 @@ describe("policy writer response ownership", () => {
           await vi.importActual<typeof import("../../server-methods.js")>(
             "../../server-methods.js",
           );
-        runtime.handler.mockImplementation((options) =>
+        runtime.handler.mockImplementation((options: GatewayRequestOptions) =>
           handleGatewayRequest({
             ...options,
             context: {
               ...options.context,
               getRuntimeConfig: () => ({}),
-              logGateway: fixture.harness.logGateway,
-            } as GatewayRequestOptions["context"],
+              logGateway: {
+                ...createSubsystemLogger("gateway-test"),
+                ...fixture.harness.logGateway,
+              },
+            },
             extraHandlers: {
               "config.patch": async ({ respond }) => {
                 holdGatewayPolicyResponse(respond);

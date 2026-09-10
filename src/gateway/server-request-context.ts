@@ -391,7 +391,16 @@ export function createGatewayRequestContext(
             : canonicalProfileId
               ? getUserProfileDisplay(canonicalProfileId)
               : undefined;
-          if (!currentProfile) {
+          // Global invalidation must not renew unchanged presence rows. Explicit
+          // callbacks can arrive after their caller has attached the new profile.
+          if (
+            !currentProfile ||
+            (profile === undefined &&
+              authenticatedUserProfile.profileId === currentProfile.id &&
+              authenticatedUserProfile.displayName === currentProfile.displayName &&
+              authenticatedUserProfile.avatarRevision === currentProfile.avatarRevision &&
+              authenticatedUserProfile.hasAvatar === currentProfile.hasAvatar)
+          ) {
             continue;
           }
           Object.assign(authenticatedUserProfile, {

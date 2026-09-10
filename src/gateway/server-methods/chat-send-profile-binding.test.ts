@@ -1,7 +1,10 @@
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
-import { resolveAgentQuestionGatewayCall } from "../../agents/harness/gateway-question-dispatch.js";
+import {
+  resolveAgentQuestionGatewayCall,
+  type AgentQuestionDispatcher,
+} from "../../agents/harness/gateway-question-dispatch.js";
 import { registerAgentSessionLoopTestLifecycle } from "../../agents/sessions/agent-session-loop-correctness.test-support.js";
 import {
   beginReplyMessageInjectionTarget,
@@ -491,7 +494,7 @@ describe("native profile-bound input admission", () => {
         const write = vi.fn();
         const questionCall = resolveAgentQuestionGatewayCall({
           version: 2,
-          call: async ({ authority }) => {
+          call: async ({ authority }: Parameters<AgentQuestionDispatcher["call"]>[0]) => {
             entered.resolve();
             await release.promise;
             if (authority.kind === "source-bound") {
