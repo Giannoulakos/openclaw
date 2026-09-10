@@ -6,6 +6,7 @@ import {
   type CurrentTurnDelivery,
 } from "./current-turn-delivery.js";
 import {
+  beginCurrentTurnReplyCompletion,
   closeCurrentTurnReplyCompletionOwner,
   copyCurrentTurnReplyCompletion,
   createCurrentTurnReplyCompletionOwner,
@@ -16,6 +17,62 @@ import { gateAgentHarnessHostTool } from "./harness/host-tool-surface.js";
 type Outcome = Awaited<ReturnType<CurrentTurnDelivery["send"]>>;
 
 describe("private current-turn reply completion", () => {
+  it("reserves across reconstructed owners without inventing a dispatch receipt", () => {
+    const owner = createCurrentTurnReplyCompletionOwner();
+    const projection = copyCurrentTurnReplyCompletion(owner, {});
+    const reconstructed = createCurrentTurnReplyCompletionOwner(projection);
+    try {
+      const first = beginCurrentTurnReplyCompletion(owner);
+      expect(first).toBeDefined();
+      expect(readCurrentTurnReplyCompletion(projection)).toBeUndefined();
+      expect(beginCurrentTurnReplyCompletion(reconstructed)).toBeUndefined();
+      first?.("pending");
+      expect(readCurrentTurnReplyCompletion(projection)).toBe("pending");
+      expect(beginCurrentTurnReplyCompletion(reconstructed)).toBeUndefined();
+      first?.("confirmed");
+      first?.(undefined);
+      expect(readCurrentTurnReplyCompletion(projection)).toBe("confirmed");
+      expect(beginCurrentTurnReplyCompletion(reconstructed)).toBeUndefined();
+    } finally {
+      closeCurrentTurnReplyCompletionOwner(owner);
+      closeCurrentTurnReplyCompletionOwner(reconstructed);
+    }
+  });
+
+  it("binds release and settlement to the admitted writer", () => {
+    const owner = createCurrentTurnReplyCompletionOwner();
+    try {
+      const first = beginCurrentTurnReplyCompletion(owner);
+      expect(first).toBeDefined();
+      first?.("pending");
+      first?.(undefined);
+      const second = beginCurrentTurnReplyCompletion(owner);
+      expect(second).toBeDefined();
+      first?.("confirmed");
+      expect(readCurrentTurnReplyCompletion(owner)).toBeUndefined();
+      second?.("pending");
+      first?.(undefined);
+      expect(readCurrentTurnReplyCompletion(owner)).toBe("pending");
+      expect(beginCurrentTurnReplyCompletion(owner)).toBeUndefined();
+      second?.("ambiguous");
+      first?.(undefined);
+      expect(readCurrentTurnReplyCompletion(owner)).toBe("ambiguous");
+      expect(beginCurrentTurnReplyCompletion(owner)).toBeUndefined();
+    } finally {
+      closeCurrentTurnReplyCompletionOwner(owner);
+    }
+  });
+
+  it("does not reopen a closed owner when its admitted send proves non-dispatch", () => {
+    const owner = createCurrentTurnReplyCompletionOwner();
+    const writer = beginCurrentTurnReplyCompletion(owner);
+    expect(writer).toBeDefined();
+    closeCurrentTurnReplyCompletionOwner(owner);
+    writer?.(undefined);
+    expect(readCurrentTurnReplyCompletion(owner)).toBeUndefined();
+    expect(beginCurrentTurnReplyCompletion(owner)).toBeUndefined();
+  });
+
   it.each([
     { outcome: { status: "sent" }, completion: "confirmed" },
     {
@@ -63,10 +120,11 @@ describe("private current-turn reply completion", () => {
     await impostor.execute();
     expect(readCurrentTurnReplyCompletion(owner)).toBeUndefined();
     const forged = { sourceReplyDelivered: true, value: "confirmed" };
-    await createCurrentTurnDeliveryTool({ send: async () => ({ status: "sent" }) }, forged).execute(
-      "forged",
-      { text: "reply" },
-    );
+    const send = vi.fn<CurrentTurnDelivery["send"]>(async () => ({ status: "sent" }));
+    await expect(
+      createCurrentTurnDeliveryTool({ send }, forged).execute("forged", { text: "reply" }),
+    ).rejects.toThrow("already been consumed");
+    expect(send).not.toHaveBeenCalled();
     expect(readCurrentTurnReplyCompletion(forged)).toBeUndefined();
     closeCurrentTurnReplyCompletionOwner(owner);
   });
@@ -151,18 +209,22 @@ describe("private current-turn reply completion", () => {
     await source.execute("send", { text: "reply" });
     closeCurrentTurnReplyCompletionOwner(owner);
     const retained = copyCurrentTurnReplyCompletion(owner, {});
-    await createCurrentTurnDeliveryTool({ send: async () => ({ status: "sent" }) }, owner).execute(
-      "stale",
-      { text: "reply" },
-    );
+    const send = vi.fn<CurrentTurnDelivery["send"]>(async () => ({ status: "sent" }));
+    await expect(
+      createCurrentTurnDeliveryTool({ send }, owner).execute("stale", { text: "reply" }),
+    ).rejects.toThrow("already been consumed");
+    expect(send).not.toHaveBeenCalled();
     expect(readCurrentTurnReplyCompletion(retained)).toBe("ambiguous");
     expect(readCurrentTurnReplyCompletion(next)).toBeUndefined();
+    await createCurrentTurnDeliveryTool({ send }, next).execute("next", { text: "reply" });
+    expect(send).toHaveBeenCalledOnce();
+    expect(readCurrentTurnReplyCompletion(next)).toBe("confirmed");
     closeCurrentTurnReplyCompletionOwner(next);
-    await createCurrentTurnDeliveryTool({ send: async () => ({ status: "sent" }) }, next).execute(
-      "closed",
-      { text: "reply" },
-    );
-    expect(readCurrentTurnReplyCompletion(next)).toBeUndefined();
+    await expect(
+      createCurrentTurnDeliveryTool({ send }, next).execute("closed", { text: "reply" }),
+    ).rejects.toThrow("already been consumed");
+    expect(send).toHaveBeenCalledOnce();
+    expect(readCurrentTurnReplyCompletion(next)).toBe("confirmed");
   });
 
   it("retains an admitted dispatch when cleanup precedes its acknowledgement", async () => {

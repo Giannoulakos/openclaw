@@ -13,7 +13,10 @@ import type { OpenClawPluginToolContext } from "../plugins/tool-types.js";
 import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
 import { normalizeDeliveryContext } from "../utils/delivery-context.shared.js";
 import { captureAgentToolSourceExecutionGuard } from "./agent-tool-source-execution-guard.js";
-import { beginCurrentTurnReplyCompletion } from "./current-turn-reply-completion.js";
+import {
+  beginCurrentTurnReplyCompletion,
+  createCurrentTurnReplyCompletionOwner,
+} from "./current-turn-reply-completion.js";
 import { stringEnum } from "./schema/typebox.js";
 import {
   asToolParamsRecord,
@@ -42,6 +45,7 @@ export type CurrentTurnDelivery = {
     bestEffort?: boolean,
     signal?: AbortSignal,
     onDispatch?: () => void,
+    onNotDispatched?: () => void,
   ): Promise<CurrentTurnDeliveryResult>;
 };
 
@@ -145,7 +149,7 @@ export function createCurrentTurnDelivery(params: {
   });
 
   return {
-    async send({ text, mediaUrl }, bestEffort, invocationSignal, onDispatch) {
+    async send({ text, mediaUrl }, bestEffort, invocationSignal, onDispatch, onNotDispatched) {
       // Capture source execution inside this invocation before any await. The
       // construction-time authority above cannot be borrowed from a later call.
       const abortSignal = invocationSignal
@@ -167,87 +171,99 @@ export function createCurrentTurnDelivery(params: {
           });
         }
       };
-      assertCurrent();
-      const { runMessageAction } = await loadMessageActionRunner();
-      const authorization = assertCurrent();
-      const cfg = params.context.getRuntimeConfig?.();
-      if (!cfg) {
-        throw new Error("current-turn delivery requires an active runtime config");
-      }
-      const result = await withPluginRuntimeRegistryScope(registry, () =>
-        runMessageAction({
-          cfg,
-          action: "send",
-          params: {
-            channel: route.channel,
-            target: route.to,
-            ...(route.accountId ? { accountId: route.accountId } : {}),
-            ...(route.threadId != null ? { threadId: route.threadId } : {}),
-            ...(text !== undefined ? { message: text } : {}),
-            ...(mediaUrl !== undefined ? { mediaUrl } : {}),
-            ...(bestEffort !== undefined ? { bestEffort } : {}),
-          },
-          defaultAccountId: route.accountId,
-          ...requesterIdentity,
-          messageActionAuthorization: {
-            requesterAccountId: authorization.requesterAccountId,
-            requesterSenderId: authorization.requesterSenderId,
-            toolContext: authorization.toolContext,
-          },
-          senderIsOwner: params.context.senderIsOwner,
-          conversationReadOrigin: params.context.conversationReadOrigin,
-          toolContext: authorization.toolContext,
-          sessionKey,
-          sessionId,
-          runId: params.runId,
-          agentId,
-          mediaAccess,
-          abortSignal,
-          onDeliveryAttempt: async () => void assertCurrent(),
-          onPlatformSendDispatch: async () => void assertCurrent(),
-          assertDirectAdapterHandoff: () => {
-            assertCurrent();
-            // The synchronous authority fence has passed. A held acknowledgement
-            // must not leave cancellation free to send another reply.
-            onDispatch?.();
-          },
-          forceCoreDelivery: true,
-          skipQueue: true,
-          dryRun: false,
-        }),
-      );
-      const sendResult = result.kind === "send" ? result.sendResult : undefined;
-      const messageId = sendResult?.result?.messageId;
-      const status =
-        sendResult?.deliveryStatus === "suppressed" &&
-        sendResult.suppressionReason === "adapter_returned_no_send"
-          ? "not_sent"
-          : sendResult?.deliveryStatus === "failed" && sendResult.sentBeforeError === true
-            ? "partial_failed"
-            : (sendResult?.deliveryStatus ?? (messageId ? "sent" : "failed"));
-      const projected: CurrentTurnDeliveryResult = {
-        status,
-        ...(messageId ? { messageId } : {}),
-        ...(sendResult?.suppressionReason
-          ? { suppressionReason: sendResult.suppressionReason }
-          : {}),
-        ...(sendResult?.error ? { error: sendResult.error } : {}),
-        ...(sendResult?.sentBeforeError ? { sentBeforeError: true } : {}),
-        ...(!sendResult ? { error: "current-turn delivery returned no send result" } : {}),
-      };
+      let handedOff = false;
+      let reportedSent = false;
       try {
         assertCurrent();
-        return projected;
-      } catch (error) {
-        if (projected.status !== "sent" && projected.sentBeforeError !== true) {
-          throw error;
+        const { runMessageAction } = await loadMessageActionRunner();
+        const authorization = assertCurrent();
+        const cfg = params.context.getRuntimeConfig?.();
+        if (!cfg) {
+          throw new Error("current-turn delivery requires an active runtime config");
         }
-        return {
-          ...projected,
-          status: "partial_failed",
-          error: formatErrorMessage(error),
-          sentBeforeError: true,
+        const result = await withPluginRuntimeRegistryScope(registry, () =>
+          runMessageAction({
+            cfg,
+            action: "send",
+            params: {
+              channel: route.channel,
+              target: route.to,
+              ...(route.accountId ? { accountId: route.accountId } : {}),
+              ...(route.threadId != null ? { threadId: route.threadId } : {}),
+              ...(text !== undefined ? { message: text } : {}),
+              ...(mediaUrl !== undefined ? { mediaUrl } : {}),
+              ...(bestEffort !== undefined ? { bestEffort } : {}),
+            },
+            defaultAccountId: route.accountId,
+            ...requesterIdentity,
+            messageActionAuthorization: {
+              requesterAccountId: authorization.requesterAccountId,
+              requesterSenderId: authorization.requesterSenderId,
+              toolContext: authorization.toolContext,
+            },
+            senderIsOwner: params.context.senderIsOwner,
+            conversationReadOrigin: params.context.conversationReadOrigin,
+            toolContext: authorization.toolContext,
+            sessionKey,
+            sessionId,
+            runId: params.runId,
+            agentId,
+            mediaAccess,
+            abortSignal,
+            onDeliveryAttempt: async () => void assertCurrent(),
+            onPlatformSendDispatch: async () => void assertCurrent(),
+            assertDirectAdapterHandoff: () => {
+              assertCurrent();
+              handedOff = true;
+              // The synchronous authority fence has passed. A held acknowledgement
+              // must not leave cancellation free to send another reply.
+              onDispatch?.();
+            },
+            forceCoreDelivery: true,
+            skipQueue: true,
+            dryRun: false,
+          }),
+        );
+        const sendResult = result.kind === "send" ? result.sendResult : undefined;
+        const messageId = sendResult?.result?.messageId;
+        const status =
+          sendResult?.deliveryStatus === "suppressed" &&
+          sendResult.suppressionReason === "adapter_returned_no_send"
+            ? "not_sent"
+            : sendResult?.deliveryStatus === "failed" && sendResult.sentBeforeError === true
+              ? "partial_failed"
+              : (sendResult?.deliveryStatus ?? (messageId ? "sent" : "failed"));
+        const projected: CurrentTurnDeliveryResult = {
+          status,
+          ...(messageId ? { messageId } : {}),
+          ...(sendResult?.suppressionReason
+            ? { suppressionReason: sendResult.suppressionReason }
+            : {}),
+          ...(sendResult?.error ? { error: sendResult.error } : {}),
+          ...(sendResult?.sentBeforeError ? { sentBeforeError: true } : {}),
+          ...(!sendResult ? { error: "current-turn delivery returned no send result" } : {}),
         };
+        reportedSent = projected.status === "sent" || projected.sentBeforeError === true;
+        try {
+          assertCurrent();
+          return projected;
+        } catch (error) {
+          if (!reportedSent) {
+            throw error;
+          }
+          return {
+            ...projected,
+            status: "partial_failed",
+            error: formatErrorMessage(error),
+            sentBeforeError: true,
+          };
+        }
+      } finally {
+        // Only the producer knows no adapter was entered. Preserve thrown errors
+        // verbatim, including AbortError identity, while releasing settled preparation.
+        if (!handedOff && !reportedSent) {
+          onNotDispatched?.();
+        }
       }
     },
   };
@@ -255,8 +271,10 @@ export function createCurrentTurnDelivery(params: {
 
 export function createCurrentTurnDeliveryTool(
   delivery: CurrentTurnDelivery,
-  completionOwner?: object,
+  completionOwner: object = createCurrentTurnReplyCompletionOwner(),
 ): AnyAgentTool {
+  // One instance remains one-shot after non-dispatch; only a newly constructed
+  // tool may retry with the released shared turn admission.
   let consumed = false;
   return {
     name: "send_current_reply",
@@ -275,24 +293,28 @@ export function createCurrentTurnDeliveryTool(
       const input = asToolParamsRecord(args);
       const text = readToolStringParam(input, "text", { required: true });
       const mediaUrl = readToolStringParam(input, "mediaUrl");
-      if (consumed) {
+      const recordCompletion = !consumed && beginCurrentTurnReplyCompletion(completionOwner);
+      if (!recordCompletion) {
         throw new ToolInputError("current-turn delivery authority has already been consumed");
       }
       consumed = true;
-      const recordCompletion = beginCurrentTurnReplyCompletion(completionOwner);
       let dispatchStarted = false;
       let provenNotDispatched = false;
       let result: CurrentTurnDeliveryResult;
       try {
-        result = await delivery.send({ text, mediaUrl }, true, signal, () => {
-          dispatchStarted = true;
-          recordCompletion?.("pending");
-        });
+        result = await delivery.send(
+          { text, mediaUrl },
+          true,
+          signal,
+          () => {
+            dispatchStarted = true;
+            recordCompletion("pending");
+          },
+          () => {
+            provenNotDispatched = true;
+          },
+        );
       } catch (error) {
-        // A post-send authority check can throw the same error class. Only
-        // a rejection before the authenticated handoff proves no dispatch.
-        provenNotDispatched =
-          !dispatchStarted && error instanceof PlatformMessageNotDispatchedError;
         const sentBeforeError = asOptionalRecord(error)?.sentBeforeError === true;
         result = {
           status: sentBeforeError ? "partial_failed" : "failed",
@@ -306,18 +328,18 @@ export function createCurrentTurnDeliveryTool(
       if (terminal) {
         // This exact instance owns the effect. Later hooks, projection rejection,
         // or cancellation cannot turn an ambiguous dispatch into another send.
-        recordCompletion?.(result.status === "sent" ? "confirmed" : "ambiguous");
+        recordCompletion(result.status === "sent" ? "confirmed" : "ambiguous");
       } else if (
         provenNotDispatched ||
         result.status === "not_sent" ||
         (result.status === "suppressed" &&
           result.suppressionReason !== "adapter_returned_no_identity")
       ) {
-        recordCompletion?.(undefined);
+        recordCompletion(undefined);
       } else if (dispatchStarted) {
         // An error without authoritative non-dispatch evidence cannot release
         // the one-shot effect, even when no message identity was acknowledged.
-        recordCompletion?.("ambiguous");
+        recordCompletion("ambiguous");
       }
       const toolResult = jsonResult(result);
       return terminal ? { ...toolResult, terminate: true } : toolResult;

@@ -2,12 +2,16 @@ import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
-import type { ChannelOutboundAdapter } from "../channels/plugins/types.public.js";
+import type {
+  ChannelMessagingAdapter,
+  ChannelOutboundAdapter,
+} from "../channels/plugins/types.public.js";
 import type { OpenClawConfig } from "../config/config.js";
 import {
   mintMessageActionTurnCapability,
   revokeMessageActionTurnCapability,
 } from "../gateway/message-action-turn-capability.js";
+import { createAbortError, isAbortError } from "../infra/abort-signal.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plugins/runtime.js";
 import {
   createDirectOutboundTestAdapter,
@@ -51,6 +55,8 @@ function createCurrentTurnDeliveryHarness(params?: {
   abortController?: AbortController;
   assertActive?: () => void;
   cfg?: OpenClawConfig;
+  resolveOutboundSessionRoute?: ChannelMessagingAdapter["resolveOutboundSessionRoute"];
+  chunker?: ChannelOutboundAdapter["chunker"];
   onPayloadNormalize?: (token: string) => void;
   sendText?: DirectSendTextMock;
   sendMedia?: DirectSendMediaMock;
@@ -79,6 +85,7 @@ function createCurrentTurnDeliveryHarness(params?: {
         plugin: createOutboundTestPlugin({
           id: "telegram",
           messaging: {
+            resolveOutboundSessionRoute: params?.resolveOutboundSessionRoute,
             targetResolver: {
               looksLikeId: (raw) => /^-?\d+$/.test(raw),
               hint: "<chatId>",
@@ -86,6 +93,7 @@ function createCurrentTurnDeliveryHarness(params?: {
           },
           outbound: {
             deliveryMode: "direct",
+            chunker: params?.chunker,
             ...(params?.onPayloadNormalize
               ? {
                   normalizePayload: ({ payload }) => {
@@ -179,6 +187,7 @@ describe("current-turn delivery tool", () => {
       true,
       undefined,
       expect.any(Function),
+      expect.any(Function),
     );
   });
 
@@ -256,59 +265,238 @@ describe("current-turn delivery tool", () => {
     }
   });
 
-  it("retains authenticated pending dispatch through abort and late acknowledgement", async () => {
-    const entered = createDeferred();
-    const acknowledge = createDeferred();
-    const abortController = new AbortController();
-    const sendText = vi.fn<DirectSendText>(async () => {
-      entered.resolve();
-      await acknowledge.promise;
-      return { channel: "telegram", messageId: "sent-1" };
-    });
-    const { current, token } = createCurrentTurnDeliveryHarness({ abortController, sendText });
-    const owner = createCurrentTurnReplyCompletionOwner();
-    const retained = copyCurrentTurnReplyCompletion(owner, {});
-    const next = createCurrentTurnReplyCompletionOwner();
-    const tool = createCurrentTurnDeliveryTool(current, owner);
-    const pending = tool.execute("held", { text: "hello" });
-    try {
-      await entered.promise;
-      expect(readCurrentTurnReplyCompletion(retained)).toBe("pending");
-      abortController.abort(new Error("cancelled during dispatch"));
-      closeCurrentTurnReplyCompletionOwner(owner);
-      expect(readCurrentTurnReplyCompletion(retained)).toBe("pending");
-      expect(readCurrentTurnReplyCompletion(next)).toBeUndefined();
-      acknowledge.resolve();
-      const result = await pending;
-      expect(result.details).toMatchObject({ status: "partial_failed", sentBeforeError: true });
-      expect(result.terminate).toBe(true);
-      expect(readCurrentTurnReplyCompletion(retained)).toBe("ambiguous");
-      expect(readCurrentTurnReplyCompletion(next)).toBeUndefined();
-      expect(sendText).toHaveBeenCalledOnce();
-    } finally {
-      acknowledge.resolve();
-      await pending;
-      closeCurrentTurnReplyCompletionOwner(owner);
-      closeCurrentTurnReplyCompletionOwner(next);
-      revokeMessageActionTurnCapability(token);
-    }
-  });
+  it.each(["confirmed", "ambiguous"] as const)(
+    "fences reconstructed tools before dispatch, during a held acknowledgement, and after %s settlement",
+    async (completion) => {
+      const entered = createDeferred();
+      const acknowledge = createDeferred();
+      const abortController = new AbortController();
+      const sendText = vi.fn<DirectSendText>(async () => {
+        entered.resolve();
+        await acknowledge.promise;
+        return { channel: "telegram", messageId: "sent-1" };
+      });
+      const { current, constructionParams, token } = createCurrentTurnDeliveryHarness({
+        abortController,
+        sendText,
+      });
+      const owner = createCurrentTurnReplyCompletionOwner();
+      const retained = copyCurrentTurnReplyCompletion(owner, {});
+      const next = createCurrentTurnReplyCompletionOwner();
+      const refreshed = createCurrentTurnDelivery({
+        ...constructionParams,
+        authority: { abortSignal: new AbortController().signal, assertActive: () => {} },
+      });
+      if (!refreshed) {
+        throw new Error("expected refreshed current-turn delivery");
+      }
+      const beforeHandoff = createCurrentTurnDeliveryTool(refreshed, owner);
+      const pending = createCurrentTurnDeliveryTool(current, owner).execute("held", {
+        text: "hello",
+      });
+      try {
+        expect(readCurrentTurnReplyCompletion(retained)).toBeUndefined();
+        await expect(beforeHandoff.execute("preparing", { text: "again" })).rejects.toThrow(
+          "already been consumed",
+        );
+        await entered.promise;
+        expect(readCurrentTurnReplyCompletion(retained)).toBe("pending");
+        if (completion === "ambiguous") {
+          abortController.abort(new Error("permission generation replaced during dispatch"));
+        }
+        await expect(
+          createCurrentTurnDeliveryTool(refreshed, owner).execute("pending", { text: "again" }),
+        ).rejects.toThrow("already been consumed");
+        expect(sendText).toHaveBeenCalledOnce();
+        acknowledge.resolve();
+        const result = await pending;
+        expect(result.details).toMatchObject(
+          completion === "confirmed"
+            ? { status: "sent" }
+            : { status: "partial_failed", sentBeforeError: true },
+        );
+        expect(result.terminate).toBe(true);
+        expect(readCurrentTurnReplyCompletion(retained)).toBe(completion);
+        await expect(
+          createCurrentTurnDeliveryTool(refreshed, owner).execute("settled", { text: "again" }),
+        ).rejects.toThrow("already been consumed");
+        closeCurrentTurnReplyCompletionOwner(owner);
+        expect(readCurrentTurnReplyCompletion(next)).toBeUndefined();
+        expect(sendText).toHaveBeenCalledOnce();
+      } finally {
+        acknowledge.resolve();
+        await pending;
+        closeCurrentTurnReplyCompletionOwner(owner);
+        closeCurrentTurnReplyCompletionOwner(next);
+        revokeMessageActionTurnCapability(token);
+      }
+    },
+  );
 
-  it("does not record pending dispatch for a rejected pre-I/O authority", async () => {
+  it("allows a reconstructed tool after authoritative non-dispatch without reusing the old instance", async () => {
+    let active = false;
     const { current, token, sendText } = createCurrentTurnDeliveryHarness({
       assertActive: () => {
-        throw new Error("host closed before dispatch");
+        if (!active) {
+          throw new Error("host closed before dispatch");
+        }
       },
     });
     const owner = createCurrentTurnReplyCompletionOwner();
+    const first = createCurrentTurnDeliveryTool(current, owner);
     try {
-      const result = await createCurrentTurnDeliveryTool(current, owner).execute("denied", {
+      const result = await first.execute("denied", {
         text: "hello",
       });
       expect(result.details).toEqual({ status: "failed", error: "host closed before dispatch" });
       expect(result.terminate).toBeUndefined();
       expect(readCurrentTurnReplyCompletion(owner)).toBeUndefined();
       expect(sendText).not.toHaveBeenCalled();
+      active = true;
+      await expect(first.execute("same-instance", { text: "hello" })).rejects.toThrow(
+        "already been consumed",
+      );
+      await expect(
+        createCurrentTurnDeliveryTool(current, owner).execute("refreshed", { text: "hello" }),
+      ).resolves.toMatchObject({ details: { status: "sent" }, terminate: true });
+      expect(readCurrentTurnReplyCompletion(owner)).toBe("confirmed");
+      expect(sendText).toHaveBeenCalledOnce();
+    } finally {
+      closeCurrentTurnReplyCompletionOwner(owner);
+      revokeMessageActionTurnCapability(token);
+    }
+  });
+
+  it("releases a cancelled route preparation only after the producer settles", async () => {
+    const preparationStarted = createDeferred();
+    const releasePreparation = createDeferred();
+    const abortController = new AbortController();
+    const reason = new Error("permission generation replaced");
+    const resolveOutboundSessionRoute = vi
+      .fn<NonNullable<ChannelMessagingAdapter["resolveOutboundSessionRoute"]>>(async () => null)
+      .mockImplementationOnce(async () => {
+        preparationStarted.resolve();
+        await releasePreparation.promise;
+        return null;
+      });
+    const { current, constructionParams, token, sendText } = createCurrentTurnDeliveryHarness({
+      abortController,
+      resolveOutboundSessionRoute,
+    });
+    let rejection: unknown;
+    const send = current.send.bind(current);
+    vi.spyOn(current, "send").mockImplementation(async (...args) => {
+      try {
+        return await send(...args);
+      } catch (error) {
+        rejection = error;
+        throw error;
+      }
+    });
+    const owner = createCurrentTurnReplyCompletionOwner();
+    const refreshed = createCurrentTurnDelivery({
+      ...constructionParams,
+      authority: { abortSignal: new AbortController().signal, assertActive() {} },
+    });
+    if (!refreshed) {
+      throw new Error("expected refreshed current-turn delivery");
+    }
+    const first = createCurrentTurnDeliveryTool(current, owner);
+    const pending = first.execute("preparing", { text: "hello" });
+    try {
+      await preparationStarted.promise;
+      abortController.abort(reason);
+      expect(readCurrentTurnReplyCompletion(owner)).toBeUndefined();
+      await expect(
+        createCurrentTurnDeliveryTool(refreshed, owner).execute("still-preparing", {
+          text: "again",
+        }),
+      ).rejects.toThrow("already been consumed");
+      expect(sendText).not.toHaveBeenCalled();
+      releasePreparation.resolve();
+      await expect(pending).resolves.toMatchObject({
+        details: { status: "failed", error: "Operation aborted" },
+      });
+      expect(isAbortError(rejection)).toBe(true);
+      expect(rejection).toMatchObject({ name: "AbortError" });
+      expect(abortController.signal.reason).toBe(reason);
+      expect(readCurrentTurnReplyCompletion(owner)).toBeUndefined();
+      await expect(first.execute("same-instance", { text: "hello" })).rejects.toThrow(
+        "already been consumed",
+      );
+      await expect(
+        createCurrentTurnDeliveryTool(refreshed, owner).execute("refreshed", { text: "hello" }),
+      ).resolves.toMatchObject({ details: { status: "sent" }, terminate: true });
+      expect(readCurrentTurnReplyCompletion(owner)).toBe("confirmed");
+      expect(resolveOutboundSessionRoute).toHaveBeenCalledTimes(2);
+      expect(sendText).toHaveBeenCalledOnce();
+    } finally {
+      releasePreparation.resolve();
+      await pending;
+      closeCurrentTurnReplyCompletionOwner(owner);
+      revokeMessageActionTurnCapability(token);
+    }
+  });
+
+  it.each(["Error", "AbortError"] as const)(
+    "preserves the exact preparation %s while reporting producer-owned non-dispatch",
+    async (name) => {
+      const cause = new Error("route preparation cause");
+      const rejection =
+        name === "AbortError"
+          ? createAbortError("route preparation cancelled", { cause })
+          : new Error("route preparation failed", { cause });
+      const { current, token, sendText } = createCurrentTurnDeliveryHarness({
+        resolveOutboundSessionRoute: async () => {
+          throw rejection;
+        },
+      });
+      const onDispatch = vi.fn();
+      const onNotDispatched = vi.fn();
+      try {
+        await expect(
+          current.send({ text: "hello" }, true, undefined, onDispatch, onNotDispatched),
+        ).rejects.toBe(rejection);
+        expect(rejection.name).toBe(name);
+        expect(rejection.cause).toBe(cause);
+        expect(isAbortError(rejection)).toBe(name === "AbortError");
+        expect(onNotDispatched).toHaveBeenCalledOnce();
+        expect(onDispatch).not.toHaveBeenCalled();
+        expect(sendText).not.toHaveBeenCalled();
+      } finally {
+        revokeMessageActionTurnCapability(token);
+      }
+    },
+  );
+
+  it("releases a returned best-effort preparation failure before any adapter handoff", async () => {
+    const chunker = vi
+      .fn<NonNullable<ChannelOutboundAdapter["chunker"]>>((text) => [text])
+      .mockImplementationOnce(() => {
+        throw new Error("chunk planning failed");
+      });
+    const { current, token, sendText } = createCurrentTurnDeliveryHarness({
+      chunker,
+      resolveOutboundSessionRoute: async () => null,
+    });
+    const send = vi.spyOn(current, "send");
+    const owner = createCurrentTurnReplyCompletionOwner();
+    try {
+      const failed = await createCurrentTurnDeliveryTool(current, owner).execute("failed", {
+        text: "hello",
+      });
+      expect(failed).toMatchObject({
+        details: { status: "failed", error: expect.stringContaining("chunk planning failed") },
+      });
+      expect(failed.terminate).toBeUndefined();
+      await expect(send.mock.results[0]?.value).resolves.toMatchObject({ status: "failed" });
+      expect(readCurrentTurnReplyCompletion(owner)).toBeUndefined();
+      expect(sendText).not.toHaveBeenCalled();
+      await expect(
+        createCurrentTurnDeliveryTool(current, owner).execute("refreshed", { text: "hello" }),
+      ).resolves.toMatchObject({ details: { status: "sent" }, terminate: true });
+      expect(sendText).toHaveBeenCalledOnce();
+      expect(readCurrentTurnReplyCompletion(owner)).toBe("confirmed");
     } finally {
       closeCurrentTurnReplyCompletionOwner(owner);
       revokeMessageActionTurnCapability(token);
@@ -503,6 +691,13 @@ describe("current-turn delivery tool", () => {
       // The adapter handoff occurred; cancellation supplies no authoritative
       // non-dispatch receipt that could safely authorize another reply.
       expect(readCurrentTurnReplyCompletion(owner)).toBe("ambiguous");
+      await expect(
+        createCurrentTurnDeliveryTool(current, owner).execute("refreshed", {
+          text: "must not escape",
+          mediaUrl: "held.png",
+        }),
+      ).rejects.toThrow("already been consumed");
+      expect(sendMedia).toHaveBeenCalledOnce();
     } finally {
       releasePreparation.resolve();
       closeCurrentTurnReplyCompletionOwner(owner);
