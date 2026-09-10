@@ -11,6 +11,7 @@ import {
   appendTranscriptMessage,
   loadTranscriptEventsSync,
 } from "../../config/sessions/session-accessor.js";
+import type { SessionCreatedActor } from "../../config/sessions/session-entry-provenance.js";
 import { SessionTranscriptProjectionUnavailableError } from "../../config/sessions/session-transcript-projection-error.js";
 import { initializeGlobalHookRunner } from "../../plugins/hook-runner-global.js";
 import type { PluginHookBeforeMessageWriteEvent } from "../../plugins/types.js";
@@ -28,6 +29,7 @@ export function useBrowserFollowupFixture() {
   return async function createBrowserFollowupFixture(
     options: {
       active?: boolean;
+      createdActor?: SessionCreatedActor;
       preserveContent?: boolean;
       transientProjectionFailures?: number;
       persistDuringDispatch?: boolean;
@@ -48,6 +50,7 @@ export function useBrowserFollowupFixture() {
           sessionId: scope.sessionId,
           updatedAt: Date.now(),
           status: active ? "running" : "done",
+          ...(options.createdActor ? { createdActor: options.createdActor } : {}),
         },
         unrelated: {
           sessionId: "unrelated-browser-session",

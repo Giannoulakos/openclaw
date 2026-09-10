@@ -16,13 +16,18 @@ import type { AgentSessionEvent } from "../../agents/sessions/agent-session-type
 import { SessionManager } from "../../agents/sessions/session-manager.js";
 import {
   listSessionPendingInputs,
+  loadExactSessionEntryReadOnly,
   loadTranscriptEventsSync,
+  patchSessionEntryCore,
 } from "../../config/sessions/session-accessor.js";
 import { rotateAgentEventLifecycleGeneration } from "../../infra/agent-events.js";
 import type { UserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import { ensureProfileForEmail, linkEmail } from "../../state/user-profiles.js";
+import { handleGatewayRequest } from "../server-methods.js";
 import { dispatchInboundMessageMock, installGatewayTestHooks } from "../test-helpers.js";
 import { useBrowserFollowupFixture } from "./chat-send-pending-inputs.test-support.js";
+import { identifiedClient } from "./sessions-sharing.test-support.js";
+import type { RespondFn } from "./types.js";
 installGatewayTestHooks();
 registerAgentSessionLoopTestLifecycle();
 const createBrowserFollowupFixture = useBrowserFollowupFixture();
@@ -32,17 +37,27 @@ describe("steering input custody", () => {
     "native fresh",
     "native committed",
     "browser custody",
+    "browser custody session ACL",
     "browser custody lifecycle",
   ] as const)(
     "owns the real backing-run outcome when authority changes at steering commit (%s)",
     async (inputState) => {
-      const fixture = await createBrowserFollowupFixture({ preserveContent: true });
+      const sharedProfileCustody =
+        inputState === "browser custody" || inputState === "browser custody session ACL";
+      const creator = sharedProfileCustody
+        ? ensureProfileForEmail("steering-session-creator@example.test")
+        : undefined;
+      const fixture = await createBrowserFollowupFixture({
+        preserveContent: true,
+        ...(creator
+          ? { createdActor: { type: "human", source: "profile", id: creator.id } as const }
+          : {}),
+      });
       const failures = new Set<unknown>();
       let releaseProviders = () => {};
       let backingRun: Promise<void> | undefined;
       try {
-        const browserCustody =
-          inputState === "browser custody" || inputState === "browser custody lifecycle";
+        const browserCustody = sharedProfileCustody || inputState === "browser custody lifecycle";
         fixture.params.queueMode = "steer";
         const operation = fixture.activeRun;
         if (!operation) {
@@ -51,6 +66,18 @@ describe("steering input custody", () => {
         const email = "steering-commit@example.test";
         const profile = ensureProfileForEmail(email);
         const target = ensureProfileForEmail("steering-commit-target@example.test");
+        if (creator) {
+          expect(profile.id).not.toBe(creator.id);
+          expect(target.id).not.toBe(creator.id);
+          fixture.client.connect.scopes = ["operator.read", "operator.write"];
+          await patchSessionEntryCore(fixture.scope, () => ({
+            visibility: "shared",
+          }));
+          expect(loadExactSessionEntryReadOnly(fixture.scope)?.entry).toMatchObject({
+            visibility: "shared",
+            createdActor: { type: "human", source: "profile", id: creator.id },
+          });
+        }
         if (!browserCustody) {
           fixture.client.connect.client = {
             id: "openclaw-ios",
@@ -178,8 +205,47 @@ describe("steering input custody", () => {
         const pending = listSessionPendingInputs(fixture.scope);
         expect(pending.total).toBe(browserCustody ? 1 : 0);
         fixture.beforeApprove.mockClear();
-        if (inputState === "browser custody") {
+        if (sharedProfileCustody) {
+          expect(session.getSteeringMessages()).toEqual([fixture.params.message]);
+          expect(session.isStreaming).toBe(true);
+          expect(released).toBe(false);
+          expect(pending.items[0]).toMatchObject({
+            runId: fixture.params.idempotencyKey,
+            state: "queued",
+            message: { idempotencyKey: inputKey, content: fixture.params.message },
+          });
           linkEmail(email, target.id);
+          if (inputState === "browser custody session ACL") {
+            const visibility = {
+              agentId: fixture.scope.agentId,
+              sessionKey: fixture.scope.sessionKey,
+              visibility: "draft",
+            };
+            const respond = vi.fn<RespondFn>();
+            await handleGatewayRequest({
+              req: {
+                type: "req",
+                id: "revoke-steering-session-access",
+                method: "session.visibility.set",
+                params: visibility,
+              },
+              client: identifiedClient(creator!.id),
+              context: fixture.context,
+              isWebchatConnect: () => true,
+              respond,
+            });
+            expect(respond).toHaveBeenCalledExactlyOnceWith(
+              true,
+              { ok: true, sessionKey: fixture.scope.sessionKey, visibility: "draft" },
+              undefined,
+            );
+            expect(loadExactSessionEntryReadOnly(fixture.scope)?.entry).toMatchObject({
+              visibility: "draft",
+              createdActor: { type: "human", source: "profile", id: creator!.id },
+            });
+            expect(operation.result).toBeNull();
+            expect(released).toBe(false);
+          }
         } else if (inputState === "browser custody lifecycle") {
           expect(session.getSteeringMessages()).toEqual([fixture.params.message]);
           expect(session.isStreaming).toBe(true);
@@ -227,7 +293,17 @@ describe("steering input custody", () => {
         }
         await backingRun;
         await fixture.finishDispatch();
-        if (inputState === "browser custody lifecycle") {
+        if (
+          inputState === "browser custody lifecycle" ||
+          inputState === "browser custody session ACL"
+        ) {
+          const sessionRevoked = inputState === "browser custody session ACL";
+          const sourceError = sessionRevoked
+            ? expect.stringContaining("session is draft for this connection")
+            : expect.stringContaining("Pending input ownership ended");
+          const backingError = sessionRevoked
+            ? expect.stringContaining("Message injection authority is no longer current")
+            : sourceError;
           const transcript = loadTranscriptEventsSync(fixture.scope);
           const sourceErrors = vi
             .mocked(fixture.context.broadcast)
@@ -267,7 +343,7 @@ describe("steering input custody", () => {
           }).toMatchObject({
             ack: originalAck,
             freshDispatchCalls: 0,
-            cancellationCalls: [["restart"]],
+            cancellationCalls: sessionRevoked ? [] : [["restart"]],
             inputHooks: 0,
             providerCalls: 1,
             streaming: false,
@@ -276,20 +352,20 @@ describe("steering input custody", () => {
             backingTerminal: {
               role: "assistant",
               stopReason: "error",
-              errorMessage: expect.stringContaining("Pending input ownership ended"),
+              errorMessage: backingError,
             },
             originalInputs: [],
             receipt: undefined,
             sourceTerminal: {
               ok: false,
               payload: { runId: fixture.params.idempotencyKey, status: "error" },
-              error: { message: expect.stringContaining("Pending input ownership ended") },
+              error: { message: sourceError },
             },
             sourceErrors: [
               {
                 runId: fixture.params.idempotencyKey,
                 state: "error",
-                errorMessage: expect.stringContaining("Pending input ownership ended"),
+                errorMessage: sourceError,
               },
             ],
             pendingInputs: {
