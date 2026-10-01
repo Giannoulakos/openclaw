@@ -30,6 +30,11 @@ import {
   claimOpenClawAgentDatabaseLease,
   releaseOpenClawAgentDatabaseLease,
 } from "./openclaw-agent-db-lease.js";
+import { withAgentDatabaseMaintenanceLease } from "./openclaw-agent-db-maintenance-lease.js";
+import {
+  assertOpenClawAgentDatabaseForMaintenance,
+  migrateOpenClawAgentDatabaseForMaintenance,
+} from "./openclaw-agent-db-maintenance.js";
 import { withOpenClawAgentDatabaseReadOnly } from "./openclaw-agent-db-readonly.js";
 import {
   registerOpenClawAgentDatabase,
@@ -37,7 +42,6 @@ import {
   unregisterOpenClawAgentDatabases,
 } from "./openclaw-agent-db-registry.js";
 import {
-  assertOpenClawAgentDatabaseForMaintenance,
   clearOpenClawAgentDatabaseOpenFailure,
   closeOpenClawAgentDatabaseByPath,
   closeOpenClawAgentDatabasesForTest,
@@ -46,14 +50,12 @@ import {
   inspectOpenClawAgentDatabaseOwner,
   isOpenClawAgentDatabaseOpen,
   listOpenClawRegisteredAgentDatabases,
-  migrateOpenClawAgentDatabaseForMaintenance,
   OPENCLAW_AGENT_SCHEMA_VERSION,
   openOpenClawAgentDatabase as openOpenClawAgentDatabaseRuntime,
   readOpenClawAgentDatabaseRegistryToken,
   resolveOpenClawAgentSqlitePath,
   runOpenClawAgentWriteTransaction,
   settleOpenClawAgentDatabaseWorkerClose,
-  withAgentDatabaseMaintenanceLease,
   withOpenClawAgentDatabaseAsync,
 } from "./openclaw-agent-db.js";
 import {
