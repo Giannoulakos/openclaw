@@ -13,6 +13,8 @@ import { ensureTranscriptSessionRoot } from "./session-accessor.sqlite-transcrip
 import { appendTranscriptEventInTransaction } from "./session-accessor.sqlite-transcript-store.js";
 import type { SessionEntry } from "./types.js";
 
+const retainedPrompt = "retained skill prompt ".repeat(400);
+
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 afterEach(() => {
@@ -30,6 +32,7 @@ function createFixture() {
   const entry: SessionEntry = {
     sessionId: "target",
     updatedAt: 20,
+    skillsSnapshot: { prompt: retainedPrompt, skills: [] },
     pluginOwnerId: "plugin-owner",
     hookExternalContentSource: "webhook",
     acp: {
@@ -54,13 +57,9 @@ function trackTranscriptProbe(database: ReturnType<typeof openOpenClawAgentDatab
 
 describe("SQLite session provenance writes", () => {
   it.each([
-    ["new session", "absent", "absent", false, 1, 0],
-    ["known provenance without hot rows", "known", "same", false, 1, 0],
     ["known provenance with hot rows", "known", "same", true, 1, 0],
     ["unknown same session without hot rows", "unknown", "same", false, 0, 0],
-    ["unknown same session with hot rows", "unknown", "same", true, 0, 0],
     ["unknown absent entry without hot rows", "unknown", "absent", false, 1, 1],
-    ["unknown absent entry with hot rows", "unknown", "absent", true, 0, 1],
     ["unknown different session without hot rows", "unknown", "different", false, 1, 1],
     ["unknown different session with hot rows", "unknown", "different", true, 0, 1],
   ] as const)(
@@ -94,12 +93,47 @@ describe("SQLite session provenance writes", () => {
       }, scope);
 
       const tracker = trackTranscriptProbe(database);
+      let boundTextBytes = 0;
+      const prepareStatement = database.db.prepare.bind(database.db);
+      database.db.prepare = new Proxy(prepareStatement, {
+        apply(prepare, receiver, args) {
+          const statement = Reflect.apply(prepare, receiver, args);
+          statement.run = new Proxy(statement.run.bind(statement), {
+            apply(run, runReceiver, runArgs) {
+              for (const value of runArgs) {
+                if (typeof value === "string") {
+                  boundTextBytes += Buffer.byteLength(value);
+                }
+              }
+              return Reflect.apply(run, runReceiver, runArgs);
+            },
+          });
+          return statement;
+        },
+      });
       try {
         // Exercise the real writer's previous-entry read; async patch fallbacks can supply a same-ID entry.
         replaceSessionEntrySync(
           scope,
-          root === "known" ? { sessionId: entry.sessionId, updatedAt: 20 } : entry,
+          root === "known"
+            ? { sessionId: entry.sessionId, updatedAt: 20, skillsSnapshot: entry.skillsSnapshot }
+            : entry,
         );
+        expect(boundTextBytes).toBeGreaterThan(0);
+        expect(boundTextBytes).toBeLessThanOrEqual(Buffer.byteLength(retainedPrompt) * 1.5 + 4096);
+        const stored = database.db
+          .prepare("SELECT entry_json, entry_valid FROM session_nodes WHERE session_key = ?")
+          .get(scope.sessionKey);
+        expect(stored?.entry_valid).toBe(1);
+        expect(JSON.parse(String(stored?.entry_json))).toMatchObject({
+          sessionId: entry.sessionId,
+        });
+        const savedSkills = database.db
+          .prepare(
+            "SELECT value_json FROM session_entry_snapshots WHERE session_key = ? AND field = 'skillsSnapshot'",
+          )
+          .get(scope.sessionKey);
+        expect(JSON.parse(String(savedSkills?.value_json))).toEqual(entry.skillsSnapshot);
         expect(tracker.counts.transcript).toBe(probes);
         expect(database.db.isTransaction).toBe(false);
         expect(

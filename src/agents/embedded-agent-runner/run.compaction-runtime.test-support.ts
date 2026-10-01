@@ -11,7 +11,7 @@ import {
 import type { PreparedAgentRunAdmission } from "../admitted-run-context.js";
 import type { EmbeddedRunCompactionRecoveryInput } from "./run/compaction-runtime.js";
 import type { PreparedEmbeddedRunInput } from "./run/execution-context.js";
-import type { ToolResultPromptProjectionState } from "./session-prompt-state.js";
+import { clearEmbeddedSessionPromptStates } from "./session-prompt-state.js";
 import { createUsageAccumulator } from "./usage-accumulator.js";
 
 type RecoveryKind = "overflow" | "timeout";
@@ -35,7 +35,8 @@ async function createRecoveryFixture(state: OpenClawTestState, options: FixtureO
     await import("../../config/sessions/session-accessor.transcript-target.js");
   const { waitForSessionTranscriptIndexReconcile } =
     await import("../../config/sessions/session-transcript-reconcile.js");
-  const { closeOpenClawAgentDatabaseByPath } = await import("../../state/openclaw-agent-db.js");
+  const { closeOpenClawAgentDatabaseByPathAsync } =
+    await import("../../state/openclaw-agent-db.js");
   const { SessionManager } = await import("../sessions/session-manager.js");
   const { makeAgentAssistantMessage, makeAgentUserMessage } =
     await import("../test-helpers/agent-message-fixtures.js");
@@ -168,7 +169,7 @@ async function createRecoveryFixture(state: OpenClawTestState, options: FixtureO
       unsubscribe();
       forgetActiveSessionForShutdown(target.sessionId);
       forgetCommittedSuccessor();
-      closeOpenClawAgentDatabaseByPath(target.storePath);
+      await closeOpenClawAgentDatabaseByPathAsync(target.storePath, target.agentId);
     }
   };
   try {
@@ -202,14 +203,16 @@ async function createRecoveryFixture(state: OpenClawTestState, options: FixtureO
       expect(writerFence?.expectedWriterRunId).toBe(runId);
       runParams.sessionTarget = { ...target, ...writerFence };
     }
-    const sessionPromptState = createEmbeddedRunSessionPromptState({
+    const sessionPromptState = await createEmbeddedRunSessionPromptState({
       runParams,
       sessionAgentId: "main",
       resolvedSessionKey: target.sessionKey,
       lifecycleGeneration: getAgentRunLifecycleGeneration(),
+      onInterrupt: (reason) => controller.abort(reason),
     });
     forgetCommittedSuccessor = () => {
       const accepted = sessionPromptState.committedCompactionSuccessor;
+      clearEmbeddedSessionPromptStates([sessionId, sessionPromptState.sessionId]);
       if (accepted) {
         forgetActiveSessionForShutdown(accepted.sessionId);
       }
@@ -344,20 +347,12 @@ async function createRecoveryFixture(state: OpenClawTestState, options: FixtureO
           lastRunPromptUsage: { input: 3_100, total: 3_100 },
         });
       }
-      const projectionState: ToolResultPromptProjectionState = {
-        replacements: new Map(),
-        frozen: new Set(),
-        ambiguousBaseKeys: new Set(),
-        restoredCacheTtl: new Map(),
-        sourceHashByKey: new Map(),
-      };
       return recoverEmbeddedRunOverflow({
         ...input,
         aborted: false,
         signalOwnedInterruption: false,
         promptError,
         attemptCompactionCount: 0,
-        toolResultPromptProjectionState: projectionState,
         prepareCurrentTranscriptRetry: sessionPromptState.continueFromCurrentTranscript,
         markOwnedTranscriptRetry: sessionPromptState.markOwnedTranscriptRetry,
       });
@@ -365,7 +360,7 @@ async function createRecoveryFixture(state: OpenClawTestState, options: FixtureO
     const snapshot = async () => {
       await drain();
       // Reopen independently: a cached manager can hide a durable append or leaf change.
-      closeOpenClawAgentDatabaseByPath(target.storePath);
+      await closeOpenClawAgentDatabaseByPathAsync(target.storePath, target.agentId);
       const manager = memoryManager ?? SessionManager.open(target, state.workspaceDir);
       const events = memoryManager
         ? memoryManager.getEntries()

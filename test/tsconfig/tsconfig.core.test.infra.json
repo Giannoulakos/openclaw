@@ -14,8 +14,6 @@
     "../../dist",
     "../../**/dist/**",
     "../../src/infra/outbound/**",
-    "../../src/infra/heartbeat-*.test.ts",
-    "../../src/infra/heartbeat-*.test.tsx",
     "../../src/infra/sqlite-*.test.ts",
     "../../src/infra/update-*.test.ts",
     "../../src/infra/update-*.test.tsx",

@@ -17,6 +17,7 @@ import type {
   OpenAIApiReasoningEffort,
   OpenAIReasoningEffort,
 } from "../providers/openai-reasoning-effort.js";
+import type { OpenAIRequestReasoningEffort } from "../providers/openai-request-reasoning.js";
 import type { OpenAIResponsesCompactedWindow } from "./openai-responses-compaction-window.js";
 
 export const DEFAULT_AZURE_OPENAI_API_VERSION = "preview";
@@ -151,7 +152,7 @@ export type OpenAIResponsesCompactionReplayState = ProviderReplayState & {
   );
 
 export type OpenAIResponsesOptions = BaseOpenAIStreamOptions & {
-  reasoning?: OpenAIReasoningEffort;
+  reasoning?: OpenAIRequestReasoningEffort;
   reasoningEffort?: OpenAIReasoningEffort;
   reasoningSummary?: "auto" | "detailed" | "concise" | null;
   replayResponsesItemIds?: boolean;
@@ -187,15 +188,6 @@ export const responsesPromptObserver = {
       responsesPromptObserver.set(target, observer);
     }
   },
-};
-
-export type OpenAIResponsesReplayContext = {
-  provider: string;
-  api: Api;
-  model: string;
-  baseUrlHash?: string;
-  sessionHash?: string;
-  authProfileHash?: string;
 };
 
 export type OpenAIResponsesRequestParams = {

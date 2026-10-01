@@ -5,10 +5,7 @@ import type { SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { projectChatSessionMetadata } from "./server-methods/chat-metadata-session-projection.js";
-import {
-  buildGatewaySessionEventFields,
-  buildGatewaySessionSnapshot,
-} from "./session-event-payload.js";
+import { buildGatewaySessionSnapshot } from "./session-event-payload.js";
 import { projectSessionPatchResult } from "./session-utils-model.js";
 import { buildGatewaySessionRow } from "./session-utils-row.js";
 import { projectSessionsPatchEntry } from "./sessions-patch.js";
@@ -21,10 +18,11 @@ const catalog = [
 describe("session runtime selection ownership projection", () => {
   it.each([
     { kind: "acp", key: "agent:main:main", locked: true },
-    { kind: "native-lock", key: "agent:main:locked", locked: true },
+    { kind: "locked-harness", key: "agent:main:locked-harness", locked: true },
+    { kind: "locked-override", key: "agent:main:locked-override", locked: true },
+    { kind: "historical-harness", key: "agent:main:historical-harness", locked: false },
+    { kind: "acp-locked-harness", key: "agent:main:acp:locked-harness", locked: true },
     { kind: "runtime-pin", key: "agent:main:pinned", locked: false },
-    { kind: "key-only", key: "agent:main:acp:no-owner", locked: false },
-    { kind: "replaced-acp", key: "agent:main:replaced", locked: false },
   ])(
     "projects $kind from the authoritative row through all client surfaces",
     async ({ kind, key, locked }) => {
@@ -43,16 +41,25 @@ describe("session runtime selection ownership projection", () => {
               },
             },
           };
-          let entry: SessionEntry = {
+          const modelLocked = ["locked-harness", "locked-override", "acp-locked-harness"].includes(
+            kind,
+          );
+          const entry: SessionEntry = {
             sessionId: "current-session",
             lifecycleRevision: "current-revision",
             updatedAt: 1,
-            ...(kind === "native-lock" ? { modelSelectionLocked: true } : {}),
-            ...(kind === "runtime-pin" ? { agentRuntimeOverride: "codex" } : {}),
+            ...(modelLocked ? { modelSelectionLocked: true } : {}),
+            ...(["locked-harness", "historical-harness", "acp-locked-harness"].includes(kind)
+              ? { agentHarnessId: "codex" }
+              : {}),
+            ...(kind === "runtime-pin" || kind === "locked-override"
+              ? { agentRuntimeOverride: "codex" }
+              : {}),
+            thinkingLevel: "high",
           };
           const scope = { agentId: "main", sessionKey: key, env: state.env };
           await upsertSessionEntryCore(scope, entry);
-          if (kind === "acp" || kind === "replaced-acp") {
+          if (kind === "acp" || kind === "acp-locked-harness") {
             await upsertAcpSessionMeta({
               cfg,
               agentId: "main",
@@ -68,10 +75,6 @@ describe("session runtime selection ownership projection", () => {
               }),
             });
           }
-          if (kind === "replaced-acp") {
-            entry = { ...entry, lifecycleRevision: "replacement-revision" };
-            await upsertSessionEntryCore(scope, entry);
-          }
           const row = buildGatewaySessionRow({
             cfg,
             agentId: "main",
@@ -84,7 +87,7 @@ describe("session runtime selection ownership projection", () => {
             skipTranscriptUsageFallback: true,
           });
           expect(row.runtimeSelectionLocked).toBe(locked);
-          expect(row.modelSelectionLocked).toBe(kind === "native-lock" ? true : undefined);
+          expect(row.modelSelectionLocked).toBe(modelLocked ? true : undefined);
           if (kind === "runtime-pin") {
             expect(row.agentRuntime?.source).toBe("session-key");
           }
@@ -103,7 +106,21 @@ describe("session runtime selection ownership projection", () => {
             modelCatalog: catalog,
           });
           expect(patched.resolved?.runtimeSelectionLocked).toBe(locked);
-          expect(buildGatewaySessionEventFields({ sessionRow: row }).runtimeSelectionLocked).toBe(
+          const expectedRuntime =
+            kind === "locked-harness" || kind === "locked-override"
+              ? { id: "codex", source: "session" }
+              : kind === "acp-locked-harness"
+                ? { id: "acpx", source: "session-key" }
+                : kind === "historical-harness"
+                  ? { id: "openclaw", source: "model" }
+                  : undefined;
+          if (expectedRuntime) {
+            expect(row.agentRuntime).toMatchObject(expectedRuntime);
+            expect(patched.resolved?.agentRuntime).toEqual(expectedRuntime);
+          }
+          expect(row.thinkingLevel).toBe("high");
+          expect(patched.resolved?.thinkingLevel).toBe("high");
+          expect(buildGatewaySessionSnapshot({ sessionRow: row }).runtimeSelectionLocked).toBe(
             locked,
           );
           const lifecycle = buildGatewaySessionSnapshot({

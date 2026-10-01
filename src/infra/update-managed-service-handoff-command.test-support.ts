@@ -5,11 +5,14 @@ import type { Readable } from "node:stream";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isPidAlive } from "../shared/pid-alive.js";
+import { resolveTestNodeExecPath } from "../test-utils/node-process.js";
 import type {
   ManagedServiceManagerBoundaryResult,
   ManagedServiceManagerBoundaryOptions,
 } from "./update-managed-service-handoff-lifecycle.test-support.js";
 import { managedServiceStateUpdateScript } from "./update-managed-service-handoff-state.test-support.js";
+
+const testNodeExecPath = resolveTestNodeExecPath();
 
 /** A LaunchAgent gateway's own environment; the handoff keeps only the label for its children. */
 export const LAUNCHD_GATEWAY_IDENTITY_ENV = {
@@ -58,7 +61,7 @@ export function createManagedServiceCommandFixture(params: {
   return {
     serviceRecovery: recovery,
     recoveryCommandArgv: [
-      process.execPath,
+      testNodeExecPath,
       ...(checksServiceIdentity ? ["--input-type=module"] : []),
       "-e",
       [
@@ -82,7 +85,7 @@ export function createManagedServiceCommandFixture(params: {
         `${managedServiceStateUpdateScript(statePath, "state.guardedRestart = process.argv.slice(1)")};`,
         ...(checksServiceIdentity
           ? [
-              `const recoveryInsideService = await isCurrentProcessInsideLaunchdService("ai.openclaw.gateway", process.env);`,
+              `const recoveryInsideService = await isCurrentProcessInsideLaunchdService("ai.openclaw.gateway");`,
               `${managedServiceStateUpdateScript(
                 statePath,
                 `state.recoveryInsideService = recoveryInsideService;
@@ -157,7 +160,7 @@ export function createManagedServiceCommandFixture(params: {
     triageCommandArgv: options?.triageMissing
       ? [path.join(root, "missing-triage")]
       : [
-          process.execPath,
+          testNodeExecPath,
           "-e",
           [
             `void (async () => {`,
@@ -528,7 +531,7 @@ export function registerManagedLaunchdTeardownTests(
       });
 
       expect(commands).toEqual(["print gui/501/ai.openclaw.gateway"]);
-      expect(state).toEqual({ nativeRelease: {} });
+      expect(state).toEqual({});
       expect(sentinel).toMatchObject({
         payload: {
           status: "skipped",

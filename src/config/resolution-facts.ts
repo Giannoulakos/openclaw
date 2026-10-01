@@ -1,3 +1,7 @@
+import {
+  parseConcreteConfigPathTokens,
+  type ConcreteConfigPathSegment,
+} from "../shared/dot-path.js";
 import type { EnvSubstitutionWarning } from "./env-substitution.js";
 import {
   coerceSecretRef,
@@ -30,17 +34,13 @@ export function createConfigResolutionFacts(
   const provider = envProvider?.trim() || DEFAULT_SECRET_PROVIDER_ALIAS;
   if (pendingEnvSecretRefs.size > 0 || resolvedEnvSecretRefs.size > 0) {
     const envSecretRefs = new Map<string, ConfigEnvSecretRefFact>();
-    for (const [path, id] of pendingEnvSecretRefs) {
-      envSecretRefs.set(path, {
-        ref: { source: "env", provider, id },
-        state: "pending",
-      });
-    }
-    for (const [path, id] of resolvedEnvSecretRefs) {
-      envSecretRefs.set(path, {
-        ref: { source: "env", provider, id },
-        state: "resolved",
-      });
+    for (const [state, refs] of [
+      ["pending", pendingEnvSecretRefs],
+      ["resolved", resolvedEnvSecretRefs],
+    ] as const) {
+      for (const [path, id] of refs) {
+        envSecretRefs.set(path, { ref: { source: "env", provider, id }, state });
+      }
     }
     envSecretRefsByFacts.set(facts, envSecretRefs);
   }
@@ -176,6 +176,58 @@ export function collectEnvSecretRefIds(value: unknown): Set<string> {
   };
   visit(value);
   return ids;
+}
+
+/** An absent path is distinct from an own property whose value is undefined. */
+function readConfigFactPathValue(
+  root: unknown,
+  tokens: readonly ConcreteConfigPathSegment[],
+): { value: unknown } | undefined {
+  let cursor: unknown = root;
+  for (const token of tokens) {
+    if (
+      typeof cursor !== "object" ||
+      cursor === null ||
+      Array.isArray(cursor) !== (typeof token === "number") ||
+      !Object.hasOwn(cursor, token)
+    ) {
+      return undefined;
+    }
+    cursor = Reflect.get(cursor, token);
+  }
+  return { value: cursor };
+}
+
+/**
+ * Carries recorded facts onto a rewritten config, dropping the paths the rewrite invalidated.
+ *
+ * Repair and migration rebuild config through `structuredClone`, so the result reaches its callers
+ * without the facts keyed to the original object. A path whose value survived the rewrite unchanged
+ * still describes the same authored reference; one the rewrite moved, dropped, or overwrote does
+ * not, so it must not keep answering path lookups on the rewritten config.
+ */
+export function copyConfigResolutionFactsThroughRewrite(source: unknown, target: unknown): void {
+  const facts = getConfigResolutionFacts(source);
+  if (facts === null) {
+    setConfigResolutionFacts(target, null);
+    return;
+  }
+  const recorded = new Set([...facts, ...(envSecretRefsByFacts.get(facts)?.keys() ?? [])]);
+  copyConfigResolutionFactsExcept(
+    source,
+    target,
+    [...recorded].filter((path) => {
+      let tokens: ConcreteConfigPathSegment[];
+      try {
+        tokens = parseConcreteConfigPathTokens(path);
+      } catch {
+        return true;
+      }
+      const before = readConfigFactPathValue(source, tokens);
+      const after = readConfigFactPathValue(target, tokens);
+      return !before || !after || !Object.is(before.value, after.value);
+    }),
+  );
 }
 
 /** Reads inline references from authored facts and structured references from their values. */

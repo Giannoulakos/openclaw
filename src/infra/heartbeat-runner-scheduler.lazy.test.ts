@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import "../test-utils/prepare-compiled-subprocesses.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import type { runHeartbeatOnce } from "./heartbeat-runner-run.js";
@@ -195,9 +196,17 @@ describe("heartbeat scheduler execution loading", { concurrent: false }, () => {
         } else if (action === "abort") {
           owner.abort();
         }
+        if (action !== "replace") {
+          await expect(result).resolves.toEqual({
+            status: "skipped",
+            reason: "handler-unavailable",
+          });
+        }
         start({ cfg, runOnce: replacement });
         await vi.advanceTimersByTimeAsync(250);
-        await expect(result).resolves.toMatchObject({ status: "ran" });
+        if (action === "replace") {
+          await expect(result).resolves.toMatchObject({ status: "ran" });
+        }
 
         release.resolve();
         await vi.dynamicImportSettled();

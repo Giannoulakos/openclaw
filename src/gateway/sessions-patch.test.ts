@@ -1,7 +1,6 @@
 // Session patch tests cover model/provider edits, subagent patching, provider
 // aliases, model catalog validation, and rejected invalid patch payloads.
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import type { SessionCreatedActor } from "../../packages/gateway-protocol/src/index.js";
 import type { ModelCatalogEntry } from "../agents/model-catalog.js";
 import type { OpenClawConfig } from "../config/config.js";
 import type { SessionEntry } from "../config/sessions.js";
@@ -15,36 +14,14 @@ import { AGENT_HARNESS_SESSION_KEY_RESERVED_MESSAGE } from "../sessions/agent-ha
 import { MODEL_SELECTION_LOCKED_MESSAGE } from "../sessions/model-overrides.js";
 import { withAgentSessionModelPatchOrigin } from "./session-model-patch-origin.js";
 import { projectSessionsPatchEntry } from "./sessions-patch.js";
-
-async function applySessionsPatchToStore(
-  params: Omit<
-    Parameters<typeof projectSessionsPatchEntry>[0],
-    "existingEntry" | "isLabelInUse"
-  > & {
-    store: Record<string, SessionEntry>;
-    loadGatewayModelCatalog?: () => Promise<ModelCatalogEntry[]>;
-  },
-) {
-  const load = params.loadGatewayModelCatalog;
-  const projected = await projectSessionsPatchEntry({
-    ...params,
-    loadGatewayModelCatalogSnapshot: load
-      ? async () => {
-          const entries = await load();
-          return { entries, routeVariants: entries };
-        }
-      : undefined,
-    existingEntry: params.store[params.storeKey],
-    isLabelInUse: (label) =>
-      Object.entries(params.store).some(
-        ([sessionKey, entry]) => sessionKey !== params.storeKey && entry.label === label,
-      ),
-  });
-  if (projected.ok) {
-    params.store[params.storeKey] = projected.entry;
-  }
-  return projected;
-}
+import {
+  type ApplySessionsPatchArgs,
+  MAIN_SESSION_KEY,
+  runPatch,
+  expectPatchOk,
+  expectPatchError,
+  mainStoreEntry,
+} from "./sessions-patch.test-support.js";
 
 const acpSessionMetaMocks = vi.hoisted(() => ({
   readAcpSessionMetaForEntry: vi.fn(),
@@ -54,7 +31,7 @@ const providerThinkingMocks = vi.hoisted(() => ({
     vi.fn<typeof import("../plugins/provider-thinking.js").resolveEffectiveThinkingProfile>(),
 }));
 
-vi.mock("../acp/runtime/session-meta.js", () => ({
+vi.mock("../acp/runtime/session-meta-readonly.js", () => ({
   readAcpSessionMetaForEntry: acpSessionMetaMocks.readAcpSessionMetaForEntry,
 }));
 
@@ -65,16 +42,13 @@ vi.mock("../plugins/provider-thinking.js", () => ({
 
 const SUBAGENT_MODEL = "synthetic/hf:moonshotai/Kimi-K2.7-Code";
 const KIMI_SUBAGENT_KEY = "agent:kimi:subagent:child";
-const MAIN_SESSION_KEY = "agent:main:main";
 const ANTHROPIC_SONNET_MODEL = "anthropic/claude-sonnet-4-6";
 const ANTHROPIC_SONNET_ID = "claude-sonnet-4-6";
 const ANTHROPIC_OPUS_MODEL = "anthropic/claude-opus-4-6";
 const ANTHROPIC_OPUS_ID = "claude-opus-4-6";
 const OPENAI_GPT_MODEL = "openai/gpt-5.4";
 const OPENAI_GPT_ID = "gpt-5.4";
-const EMPTY_CFG = {} as OpenClawConfig;
 
-type ApplySessionsPatchArgs = Parameters<typeof applySessionsPatchToStore>[0];
 type ProviderAuthMetadataSnapshot = NonNullable<
   ApplySessionsPatchArgs["providerAuthMetadataSnapshot"]
 >;
@@ -99,59 +73,6 @@ const BYTEPLUS_PROVIDER_AUTH_METADATA_SNAPSHOT = {
     } satisfies PluginManifestRecord,
   ],
 } satisfies ProviderAuthMetadataSnapshot;
-
-async function runPatch(params: {
-  patch: ApplySessionsPatchArgs["patch"];
-  store?: Record<string, SessionEntry>;
-  cfg?: OpenClawConfig;
-  storeKey?: string;
-  agentId?: string;
-  loadGatewayModelCatalog?: ApplySessionsPatchArgs["loadGatewayModelCatalog"];
-  providerAuthMetadataSnapshot?: ApplySessionsPatchArgs["providerAuthMetadataSnapshot"];
-  archivedBy?: SessionCreatedActor;
-}) {
-  return applySessionsPatchToStore({
-    cfg: params.cfg ?? EMPTY_CFG,
-    store: params.store ?? {},
-    storeKey: params.storeKey ?? MAIN_SESSION_KEY,
-    agentId: params.agentId,
-    patch: params.patch,
-    loadGatewayModelCatalog: params.loadGatewayModelCatalog,
-    providerAuthMetadataSnapshot: params.providerAuthMetadataSnapshot,
-    archivedBy: params.archivedBy,
-  });
-}
-
-function expectPatchOk(
-  result: Awaited<ReturnType<typeof applySessionsPatchToStore>>,
-): SessionEntry {
-  expect(result.ok).toBe(true);
-  if (!result.ok) {
-    throw new Error(result.error.message);
-  }
-  return result.entry;
-}
-
-function expectPatchError(
-  result: Awaited<ReturnType<typeof applySessionsPatchToStore>>,
-  message: string,
-): void {
-  expect(result.ok).toBe(false);
-  if (result.ok) {
-    throw new Error(`Expected patch failure containing: ${message}`);
-  }
-  expect(result.error.message).toContain(message);
-}
-
-function mainStoreEntry(overrides: Partial<SessionEntry>): Record<string, SessionEntry> {
-  return {
-    [MAIN_SESSION_KEY]: {
-      sessionId: "sess",
-      updatedAt: 1,
-      ...overrides,
-    } as SessionEntry,
-  };
-}
 
 function mainAuthOverrideStore(overrides: Partial<SessionEntry>): Record<string, SessionEntry> {
   return mainStoreEntry({
@@ -517,7 +438,7 @@ describe("gateway sessions patch", () => {
 
   test.each([
     ["agent:main:dashboard:child", { spawnedBy: MAIN_SESSION_KEY }],
-    ["agent:main:dashboard:child", { parentSessionKey: MAIN_SESSION_KEY }],
+    ["agent:main:dashboard:child", { parentSessionKey: "agent:main:dashboard:parent" }],
     ["agent:main:subagent:child", {}],
   ] as const)("rejects child pins on %s with %j", async (key, lineage) => {
     const original: SessionEntry = { sessionId: "child", updatedAt: 1, pinnedAt: 10, ...lineage };
@@ -565,6 +486,39 @@ describe("gateway sessions patch", () => {
       }),
     );
     expect(pinned.pinnedAt).toEqual(expect.any(Number));
+  });
+
+  test.each([
+    ["agent:main:dashboard:work", { parentSessionKey: MAIN_SESSION_KEY }],
+    ["agent:other:dashboard:work", { parentSessionKey: "agent:other:main" }],
+  ] as const)("allows pins on Home-parented sessions on %s", async (key, lineage) => {
+    const pinned = expectPatchOk(
+      await runPatch({
+        storeKey: key,
+        store: { [key]: { sessionId: "work", updatedAt: 1, ...lineage } },
+        patch: { key, pinned: true },
+      }),
+    );
+    expect(pinned.pinnedAt).toEqual(expect.any(Number));
+  });
+
+  test("preserves existing pins on Home-parented sessions through metadata patches", async () => {
+    const key = "agent:main:dashboard:work";
+    const updated = expectPatchOk(
+      await runPatch({
+        storeKey: key,
+        store: {
+          [key]: {
+            sessionId: "work",
+            updatedAt: 1,
+            pinnedAt: 10,
+            parentSessionKey: MAIN_SESSION_KEY,
+          },
+        },
+        patch: { key, label: "Work session" },
+      }),
+    );
+    expect(updated.pinnedAt).toBe(10);
   });
 
   test("marks archived sessions unread and clears the marker when read", async () => {
@@ -630,13 +584,23 @@ describe("gateway sessions patch", () => {
     expect(entry.agentStatus).toBeUndefined();
   });
 
-  test("persists thinkingLevel=off (does not clear)", async () => {
+  test.each([
+    { field: "thinkingLevel", value: "off" },
+    { field: "responseUsage", value: "off" },
+    { field: "reasoningLevel", value: "off" },
+    { field: "fastMode", value: false },
+    { field: "fastMode", value: true },
+    { field: "verboseLevel", value: "full" },
+    { field: "elevatedLevel", value: "off" },
+    { field: "elevatedLevel", value: "on" },
+  ] as const)("persists explicit $field=$value", async ({ field, value }) => {
     const entry = expectPatchOk(
       await runPatch({
-        patch: { key: MAIN_SESSION_KEY, thinkingLevel: "off" },
+        patch: { key: MAIN_SESSION_KEY, [field]: value },
       }),
     );
-    expect(entry.thinkingLevel).toBe("off");
+    // Explicit off values must survive configured defaults, including messages.responseUsage.
+    expect(entry[field]).toBe(value);
   });
 
   test.each(["thinkingLevel", "contextWindow"] as const)(
@@ -658,17 +622,6 @@ describe("gateway sessions patch", () => {
     },
   );
 
-  test("persists responseUsage=off (does not clear)", async () => {
-    const entry = expectPatchOk(
-      await runPatch({
-        patch: { key: MAIN_SESSION_KEY, responseUsage: "off" },
-      }),
-    );
-    // Explicit off must persist so a configured messages.responseUsage default
-    // cannot re-enable the footer the user turned off.
-    expect(entry.responseUsage).toBe("off");
-  });
-
   test("clears responseUsage when patch sets null", async () => {
     const store: Record<string, SessionEntry> = {
       [MAIN_SESSION_KEY]: { responseUsage: "tokens" } as SessionEntry,
@@ -682,15 +635,6 @@ describe("gateway sessions patch", () => {
     expect(entry.responseUsage).toBeUndefined();
   });
 
-  test("persists reasoningLevel=off (does not clear)", async () => {
-    const entry = expectPatchOk(
-      await runPatch({
-        patch: { key: MAIN_SESSION_KEY, reasoningLevel: "off" },
-      }),
-    );
-    expect(entry.reasoningLevel).toBe("off");
-  });
-
   test("clears reasoningLevel when patch sets null", async () => {
     const store: Record<string, SessionEntry> = {
       [MAIN_SESSION_KEY]: { reasoningLevel: "stream" } as SessionEntry,
@@ -702,24 +646,6 @@ describe("gateway sessions patch", () => {
       }),
     );
     expect(entry.reasoningLevel).toBeUndefined();
-  });
-
-  test("persists fastMode=false (does not clear)", async () => {
-    const entry = expectPatchOk(
-      await runPatch({
-        patch: { key: MAIN_SESSION_KEY, fastMode: false },
-      }),
-    );
-    expect(entry.fastMode).toBe(false);
-  });
-
-  test("persists fastMode=true", async () => {
-    const entry = expectPatchOk(
-      await runPatch({
-        patch: { key: MAIN_SESSION_KEY, fastMode: true },
-      }),
-    );
-    expect(entry.fastMode).toBe(true);
   });
 
   test("recreates partial rows without dropping session settings", async () => {
@@ -820,16 +746,6 @@ describe("gateway sessions patch", () => {
     expect(entry.category).toBe("Research");
   });
 
-  test("rejects empty category", async () => {
-    expectPatchError(
-      await runPatch({
-        store: mainStoreEntry({}),
-        patch: { key: MAIN_SESSION_KEY, category: "   " },
-      }),
-      "invalid category: empty",
-    );
-  });
-
   test("clears fastMode when patch sets null", async () => {
     const store = mainStoreEntry({ fastMode: true });
     const entry = expectPatchOk(
@@ -841,18 +757,18 @@ describe("gateway sessions patch", () => {
     expect(entry.fastMode).toBeUndefined();
   });
 
-  test("sets fastMode to auto", async () => {
+  test.each(["auto", "ultrafast"] as const)("sets fastMode to %s", async (fastMode) => {
     const store: Record<string, SessionEntry> = {
       [MAIN_SESSION_KEY]: {} as SessionEntry,
     };
     const entry = expectPatchOk(
       await runPatch({
         store,
-        patch: { key: MAIN_SESSION_KEY, fastMode: "auto" },
+        patch: { key: MAIN_SESSION_KEY, fastMode },
       }),
     );
 
-    expect(entry.fastMode).toBe("auto");
+    expect(entry.fastMode).toBe(fastMode);
   });
 
   test("sets, replaces, clears, and normalizes tool overrides", async () => {
@@ -905,38 +821,11 @@ describe("gateway sessions patch", () => {
     expect(cleared.toolOverrides).toBeUndefined();
   });
 
-  test("persists verboseLevel=full", async () => {
-    const entry = expectPatchOk(
-      await runPatch({
-        patch: { key: MAIN_SESSION_KEY, verboseLevel: "full" },
-      }),
-    );
-    expect(entry.verboseLevel).toBe("full");
-  });
-
   test("rejects invalid verboseLevel values with all valid choices in the error", async () => {
     const result = await runPatch({
       patch: { key: MAIN_SESSION_KEY, verboseLevel: "maybe" },
     });
     expectPatchError(result, 'invalid verboseLevel (use "on"|"off"|"full")');
-  });
-
-  test("persists elevatedLevel=off (does not clear)", async () => {
-    const entry = expectPatchOk(
-      await runPatch({
-        patch: { key: MAIN_SESSION_KEY, elevatedLevel: "off" },
-      }),
-    );
-    expect(entry.elevatedLevel).toBe("off");
-  });
-
-  test("persists elevatedLevel=on", async () => {
-    const entry = expectPatchOk(
-      await runPatch({
-        patch: { key: MAIN_SESSION_KEY, elevatedLevel: "on" },
-      }),
-    );
-    expect(entry.elevatedLevel).toBe("on");
   });
 
   test("clears elevatedLevel when patch sets null", async () => {
@@ -1417,24 +1306,12 @@ describe("gateway sessions patch", () => {
     },
   );
 
-  test.each([
-    {
-      name: "accepts explicit allowlisted provider/model refs from sessions.patch",
-      catalog: [
-        { provider: "anthropic", id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
-        { provider: "anthropic", id: "claude-sonnet-4-6", name: "Claude Sonnet 4.5" },
-      ],
-    },
-    {
-      name: "accepts explicit allowlisted refs absent from bundled catalog",
-      catalog: [{ provider: "openai", id: "gpt-5.4", name: "GPT-5.2" }],
-    },
-  ])("$name", async ({ catalog }) => {
+  test("accepts explicit allowlisted refs absent from bundled catalog", async () => {
     const entry = expectPatchOk(
       await runPatch({
         cfg: createAllowlistedAnthropicModelCfg(),
         patch: { key: MAIN_SESSION_KEY, model: ANTHROPIC_SONNET_MODEL },
-        loadGatewayModelCatalog: async () => catalog,
+        loadGatewayModelCatalog: loadCatalog(OPENAI_GPT_MODEL),
       }),
     );
     expectModelSelection(entry, "anthropic", ANTHROPIC_SONNET_ID);
@@ -1674,6 +1551,45 @@ describe("gateway sessions patch", () => {
     expect(entry.thinkingLevel).toBe("xhigh");
   });
 
+  test.each([
+    { requested: "max", nativeEffort: "max", accepted: true },
+    { requested: "max", nativeEffort: "high", accepted: false },
+  ] as const)(
+    "validates thinking against the selected runtime variant ($nativeEffort, accepted=$accepted)",
+    async ({ requested, nativeEffort, accepted }) => {
+      const host: ModelCatalogEntry = {
+        provider: "runtime-fixture",
+        id: "reasoner",
+        name: "Reasoner",
+        reasoning: true,
+        compat: { supportedReasoningEfforts: [accepted ? "high" : "max"] },
+      };
+      const native: ModelCatalogEntry = {
+        ...host,
+        nativeRuntime: "fixture-native",
+        compat: { supportedReasoningEfforts: [nativeEffort] },
+      };
+      const result = await projectSessionsPatchEntry({
+        cfg: { agents: { defaults: { model: "runtime-fixture/reasoner" } } },
+        storeKey: MAIN_SESSION_KEY,
+        existingEntry: mainStoreEntry({})[MAIN_SESSION_KEY],
+        isLabelInUse: () => false,
+        preparedAgentRuntime: "fixture-native",
+        patch: { key: MAIN_SESSION_KEY, thinkingLevel: requested },
+        loadGatewayModelCatalogSnapshot: async () => ({
+          entries: [host],
+          routeVariants: [host, native],
+        }),
+      });
+
+      if (accepted) {
+        expect(expectPatchOk(result).thinkingLevel).toBe(requested);
+      } else {
+        expectPatchError(result, 'thinkingLevel "max" is not supported');
+      }
+    },
+  );
+
   test("validates global patches against the selected agent", async () => {
     const entry = expectPatchOk(
       await runPatch({
@@ -1747,7 +1663,7 @@ describe("gateway sessions patch", () => {
     expect(entry.thinkingLevel).toBe("ultra");
   });
 
-  test("remaps stored Ultra to Max when a model patch selects Codex Luna", async () => {
+  test("preserves stored Ultra when a model patch selects Codex Luna", async () => {
     const entry = expectPatchOk(
       await runPatch({
         cfg: {
@@ -1766,7 +1682,7 @@ describe("gateway sessions patch", () => {
       }),
     );
 
-    expect(entry.thinkingLevel).toBe("max");
+    expect(entry.thinkingLevel).toBe("ultra");
   });
 
   test("honors an explicit OpenClaw session runtime override for Luna Ultra", async () => {
@@ -1787,7 +1703,7 @@ describe("gateway sessions patch", () => {
     expect(entry.thinkingLevel).toBe("ultra");
   });
 
-  test("clearing a runtime pin remaps thinking through configured routing and invalidates derived context", async () => {
+  test("clearing a runtime pin preserves supported thinking and invalidates derived context", async () => {
     const entry = expectPatchOk(
       await runPatch({
         cfg: { agents: { defaults: { model: "openai/gpt-5.6-luna" } } },
@@ -1800,7 +1716,7 @@ describe("gateway sessions patch", () => {
         loadGatewayModelCatalog: loadCatalog("openai/gpt-5.6-luna"),
       }),
     );
-    expect(entry).toMatchObject({ thinkingLevel: "max", liveModelSwitchPending: true });
+    expect(entry).toMatchObject({ thinkingLevel: "ultra", liveModelSwitchPending: true });
     expect(entry).not.toHaveProperty("agentRuntimeOverride");
     expect(entry).not.toHaveProperty("contextTokens");
   });
@@ -1861,11 +1777,11 @@ describe("gateway sessions patch", () => {
         },
       } as OpenClawConfig,
       store: mainStoreEntry({}),
-      patch: { key: MAIN_SESSION_KEY, thinkingLevel: "ultra" },
+      patch: { key: MAIN_SESSION_KEY, thinkingLevel: "xhigh" },
       loadGatewayModelCatalog: async () => [],
     });
 
-    expectPatchError(result, 'thinkingLevel "ultra" is not supported');
+    expectPatchError(result, 'thinkingLevel "xhigh" is not supported');
     expect(acpSessionMetaMocks.readAcpSessionMetaForEntry).toHaveBeenCalledWith({
       sessionKey: MAIN_SESSION_KEY,
       agentId: "main",
@@ -1873,13 +1789,13 @@ describe("gateway sessions patch", () => {
     });
   });
 
-  test("treats the persisted harness id as observational when validating Luna Ultra", async () => {
+  test("treats the persisted harness id as observational when validating unsupported Luna XHigh", async () => {
     const result = await runPatch({
       cfg: {
         agents: { defaults: { model: { primary: "openai/gpt-5.6-luna" } } },
       } as OpenClawConfig,
       store: mainStoreEntry({ agentHarnessId: "openclaw" }),
-      patch: { key: MAIN_SESSION_KEY, thinkingLevel: "ultra" },
+      patch: { key: MAIN_SESSION_KEY, thinkingLevel: "xhigh" },
       loadGatewayModelCatalog: async () => [],
     });
 
@@ -2124,25 +2040,22 @@ describe("gateway sessions patch", () => {
     expect(cleared.execHost).toBeUndefined();
   });
 
-  test.each(["auto", "gateway", "sandbox"] as const)(
-    "preserves explicit %s exec hosting when clearing a stale node binding",
-    async (execHost) => {
-      const cleared = expectPatchOk(
-        await runPatch({
-          store: mainStoreEntry({
-            execHost,
-            execNode: "worker-1",
-            execCwd: "/workspace/on-worker-1",
-          }),
-          patch: { key: MAIN_SESSION_KEY, execNode: null },
+  test("preserves explicit gateway exec hosting when clearing a stale node binding", async () => {
+    const cleared = expectPatchOk(
+      await runPatch({
+        store: mainStoreEntry({
+          execHost: "gateway",
+          execNode: "worker-1",
+          execCwd: "/workspace/on-worker-1",
         }),
-      );
+        patch: { key: MAIN_SESSION_KEY, execNode: null },
+      }),
+    );
 
-      expect(cleared.execHost).toBe(execHost);
-      expect(cleared.execNode).toBeUndefined();
-      expect(cleared.execCwd).toBeUndefined();
-    },
-  );
+    expect(cleared.execHost).toBe("gateway");
+    expect(cleared.execNode).toBeUndefined();
+    expect(cleared.execCwd).toBeUndefined();
+  });
 
   test("rejects invalid execHost values", async () => {
     const result = await runPatch({

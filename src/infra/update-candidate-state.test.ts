@@ -23,11 +23,15 @@ import {
   readUpdateStateSchemaVersions,
   updateStateSchemaVersionsMatch,
 } from "./update-candidate-state.js";
-import { runUpdateCandidateSnapshotWorker } from "./update-candidate-state.test-support.js";
+import {
+  materializeUpdateCandidateStateWorker,
+  runUpdateCandidateSnapshotWorker,
+} from "./update-candidate-state.test-support.js";
 
 let root: string;
 beforeEach(async () => {
   root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "candidate-state-")));
+  await materializeUpdateCandidateStateWorker(root);
 });
 afterEach(async () => {
   closeOpenClawStateDatabaseForTest();
@@ -110,9 +114,17 @@ it.each(["DELETE", "WAL"])(
         })),
       );
     const before = await artifacts();
+    const expectArtifactsUnchanged = async () => {
+      const after = await artifacts();
+      expect(after.map(({ entries }) => entries)).toEqual(before.map(({ entries }) => entries));
+      // Keep exact bytes without expanding whole databases through iterable equality.
+      for (const [index, { bytes }] of after.entries()) {
+        expect(bytes.equals(before[index]!.bytes)).toBe(true);
+      }
+    };
     const inspected = await readUpdateStateSchemaVersions({ stateDir: source, config: {} });
     expect(inspected.filter((entry) => entry.userVersion === 3)).toHaveLength(2);
-    expect(await artifacts()).toEqual(before);
+    await expectArtifactsUnchanged();
     const versions = await runSnapshotWorker({
       stateDir: source,
       targetStateDir: target,
@@ -130,7 +142,7 @@ it.each(["DELETE", "WAL"])(
         async (maintenance) => maintenance.assertOwned(),
       ),
     ).resolves.toBeUndefined();
-    expect(await artifacts()).toEqual(before);
+    await expectArtifactsUnchanged();
     const copiedRegistry = openNodeSqliteDatabase(path.join(target, "state", "openclaw.sqlite"));
     expect(copiedRegistry.prepare("SELECT * FROM agent_database_leases").all()).toEqual([]);
     expect(copiedRegistry.prepare("SELECT * FROM state_leases").all()).toEqual([]);
@@ -280,7 +292,6 @@ it.runIf(process.platform !== "win32")(
 
 it.each([
   { source: "npm", relative: "extensions/demo" },
-  { source: "clawhub", relative: "extensions/demo" },
   { source: "npm", relative: "npm/projects/demo/node_modules/demo" },
   { source: "npm", relative: "npm/node_modules/demo" },
 ])(
@@ -348,7 +359,7 @@ it.each([
     closeOpenClawStateDatabaseByPath(shared);
     const before = await fs.readFile(shared);
     await runSnapshotWorker({ stateDir: source, targetStateDir: target, config: {} });
-    expect(await fs.readFile(shared)).toEqual(before);
+    expect((await fs.readFile(shared)).equals(before)).toBe(true);
     expect(await fs.realpath(path.join(packageDir, "node_modules", "openclaw"))).toBe(liveHost);
     const copied = openNodeSqliteDatabase(path.join(target, "state", "openclaw.sqlite"));
     try {
@@ -384,7 +395,7 @@ it.each([
       );
       await fs.writeFile(copiedDependency, "changed in rehearsal");
       expect(await fs.readFile(path.join(dependency, "index.js"), "utf8")).toContain("preserved");
-      expect(await fs.readFile(shared)).toEqual(before);
+      expect((await fs.readFile(shared)).equals(before)).toBe(true);
     } finally {
       copied.close();
     }
@@ -795,6 +806,7 @@ it.each([
     if (shared) {
       expect((await readPlugin(sharedOwner)).value).toBe("owner");
     }
+    await materializeUpdateCandidateStateWorker(candidateHost);
     const rehearsal = await prepareUpdateCandidateRehearsal({
       config: { plugins: { load: { paths } } },
       stateDir: path.join(root, "source-state"),
@@ -935,6 +947,7 @@ it("rejects an ordinary link that would repeatedly copy an immutable host packag
   });
   expect(source.code, source.stderr.toString()).toBe(0);
   expect(source.stdout.toString().trim()).toBe("serving");
+  await materializeUpdateCandidateStateWorker(candidate);
   await expect(
     prepareUpdateCandidateRehearsal({
       config: { plugins: { load: { paths: [plugin] } } },

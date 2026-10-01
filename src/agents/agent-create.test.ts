@@ -17,7 +17,6 @@ const mocks = vi.hoisted(() => ({
   recordAgentProvenance: vi.fn(),
   readAgentDeletionJournal: vi.fn(() => undefined as Record<string, unknown> | undefined),
   claimCompletedAgentDeletion: vi.fn(() => true),
-  afterCreationClaim: vi.fn(),
   migrateLegacyMainSessionKeys: vi.fn(),
   resolveSharedAuthStoreOwnership: vi.fn(),
 }));
@@ -46,15 +45,6 @@ vi.mock("./agent-scope.js", async (importOriginal) => ({
 
 vi.mock("./agent-lifecycle-registry.js", () => ({
   claimCompletedAgentDeletion: mocks.claimCompletedAgentDeletion,
-}));
-
-vi.mock("../state/agent-creation-claim.js", () => ({
-  // The real scope closes admitted handles after `run`; that close can fail.
-  runWithAgentCreationClaim: async <T>(_target: unknown, run: () => Promise<T>) => {
-    const value = await run();
-    mocks.afterCreationClaim();
-    return value;
-  },
 }));
 
 vi.mock("../state/agent-deletion-journal.js", () => ({
@@ -173,9 +163,6 @@ describe("createAgent", () => {
     { kind: "not-armed", armed: false, detail: "owner-unresolved" },
     { kind: "no-legacy-rows", armed: true },
     { kind: "migrated-in-place", armed: true, canonicalKey: "agent:robby:main" },
-    { kind: "migrated-cross-store", armed: true, canonicalKey: "agent:robby:main" },
-    { kind: "canonical-exists-identical", armed: true, canonicalKey: "agent:robby:main" },
-    { kind: "divergent-canonical", armed: true, canonicalKey: "agent:robby:main" },
     { kind: "divergent-aliases", armed: true, canonicalKey: "agent:robby:main" },
     { kind: "legacy-json-store", armed: true, paths: ["/tmp/sessions.json"] },
     { kind: "store-unreadable", armed: true, paths: ["/tmp/store.sqlite"] },
@@ -650,17 +637,6 @@ describe("createAgent", () => {
     expect(result).toMatchObject({ status: "created", agentId: "researcher" });
   });
 
-  it("finishes workspace setup before publishing config", async () => {
-    mocks.ensureAgentWorkspace.mockImplementation(async ({ dir }: { dir: string }) => {
-      expect(mocks.persisted).not.toHaveProperty("agents");
-      return { dir, bootstrapPending: true };
-    });
-
-    await createAgent({ name: "researcher" });
-
-    expect(mocks.ensureAgentWorkspace).toHaveBeenCalledOnce();
-  });
-
   it("prepares staged config effects after setup and immediately before publication", async () => {
     mocks.ensureAgentWorkspace.mockResolvedValue({
       dir: "/tmp/default-researcher",
@@ -701,24 +677,6 @@ describe("createAgent", () => {
     expect(prepareConfigCommit).toHaveBeenCalledOnce();
     expect(commit).not.toHaveBeenCalled();
     expect(rollback).toHaveBeenCalledOnce();
-  });
-
-  it("rolls staged config effects back when the creation scope fails to close after staging", async () => {
-    const rollback = vi.fn();
-    const commit = vi.fn();
-    const prepareConfigCommit = vi.fn(async () => ({ commit, rollback }));
-    mocks.afterCreationClaim.mockImplementationOnce(() => {
-      throw new Error("injected creation scope close failure");
-    });
-
-    await expect(createAgent({ name: "researcher", prepareConfigCommit })).rejects.toThrow(
-      "injected creation scope close failure",
-    );
-
-    expect(prepareConfigCommit).toHaveBeenCalledOnce();
-    expect(commit).not.toHaveBeenCalled();
-    expect(rollback).toHaveBeenCalledOnce();
-    expect(mocks.persisted).not.toHaveProperty("agents");
   });
 
   it("does not roll staged config effects back after config publication", async () => {

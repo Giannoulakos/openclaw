@@ -7,21 +7,19 @@ import type {
   OpenClawAgentDatabase,
   OpenClawAgentDatabaseOptions,
 } from "./openclaw-agent-db-contract.js";
+import { resolveOpenClawAgentSqlitePath } from "./openclaw-agent-db.paths.js";
 import { resolveOpenClawStateSqlitePath } from "./openclaw-state-db.paths.js";
 
 type AgentCreationClaimScope = {
   agentId: string;
   statePath: string;
   isActive: () => boolean;
-  registerClose: (close: () => void) => void;
+  registerClose: (close: () => Promise<void>) => void;
+  retryClose: () => Promise<void>;
 };
 
-// A completed deletion record keeps fencing the dead identity until the creation lifecycle
-// claims it. Creation is that claimant, so while it stages state for the identity it is
-// recreating it may open that identity's own databases beneath a completed record. The scope
-// never covers incomplete deletions, other identities, or callers outside creation, and it
-// owns every handle it admits: they stay private to the scope and close when it settles, so
-// a failed creation leaves no warm handle behind its retained tombstone.
+// Only a creation receipt may admit its identity beneath a completed tombstone.
+// Failed disposal retains handle custody, never the expired scope's write authority.
 const creationClaim = resolveGlobalSingleton(
   Symbol.for("openclaw.agentCreationClaim"),
   () => new AsyncLocalStorage<AgentCreationClaimScope>(),
@@ -37,7 +35,25 @@ export async function runWithAgentCreationClaim<T>(
   run: () => Promise<T>,
 ): Promise<T> {
   let active = true;
-  const closers = new Set<() => void>();
+  const closers = new Set<() => Promise<void>>();
+  let pendingClose: Promise<unknown[]> | undefined;
+  const closeHandles = (): Promise<unknown[]> => {
+    pendingClose ??= (async () => {
+      const errors: unknown[] = [];
+      for (const close of [...closers].toReversed()) {
+        try {
+          await close();
+          closers.delete(close);
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      return errors;
+    })().finally(() => {
+      pendingClose = undefined;
+    });
+    return pendingClose;
+  };
   const scope: AgentCreationClaimScope = {
     agentId: normalizeAgentId(target.agentId),
     statePath: path.resolve(resolveOpenClawStateSqlitePath(target.env ?? process.env)),
@@ -48,25 +64,34 @@ export async function runWithAgentCreationClaim<T>(
       }
       closers.add(close);
     },
+    retryClose: async () => {
+      if (active) {
+        throw new Error("Agent database belongs to an active agent creation claim.");
+      }
+      // Join settlement before retrying; overlapping scopes must not close a successor.
+      await pendingClose;
+      const errors = await closeHandles();
+      if (errors.length > 0) {
+        throw new AggregateError(errors, "Agent creation database close retry failed.");
+      }
+    },
   };
   return await creationClaim.run(scope, async () => {
     let outcome: Result<T, unknown>;
     const closeErrors: unknown[] = [];
     try {
+      for (const previous of new Set(creationHandles.values())) {
+        if (previous.agentId === scope.agentId && previous.statePath === scope.statePath) {
+          await previous.retryClose();
+        }
+      }
       outcome = ok(await run());
     } catch (error) {
       outcome = err(error);
     } finally {
-      // Retained async callbacks keep this same store and must lose the exemption; handles
-      // admitted under it close here so nothing warm outlives the receipt phase.
+      // Revoke retained callbacks before awaiting native disposal.
       active = false;
-      for (const close of [...closers].toReversed()) {
-        try {
-          close();
-        } catch (error) {
-          closeErrors.push(error);
-        }
-      }
+      closeErrors.push(...(await closeHandles()));
     }
     if (!outcome.ok) {
       throw closeErrors.length > 0
@@ -136,6 +161,19 @@ export function assertAgentCreationClaimAccess(
   );
   if (owner !== scope) {
     throw new Error("Agent database belongs to an active agent creation claim.");
+  }
+}
+
+/** A different spelling or state root must not borrow a creation-owned physical store. */
+export function assertAgentCreationClaimAliases(
+  options: OpenClawAgentDatabaseOptions,
+  isSamePath: (left: string, right: string) => boolean,
+): void {
+  const pathname = resolveOpenClawAgentSqlitePath(options);
+  for (const owned of creationHandles.keys()) {
+    if (isSamePath(owned.path, pathname)) {
+      assertAgentCreationClaimAccess(owned, options);
+    }
   }
 }
 

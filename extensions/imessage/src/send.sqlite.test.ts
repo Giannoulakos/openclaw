@@ -53,13 +53,21 @@ describe("iMessage send SQLite receipt recovery", () => {
   });
 
   it("retains the reader across polling and joins cleanup before publishing the receipt", async () => {
-    vi.useFakeTimers({ now: 10_000 });
     const sqliteRuntime = await import("openclaw/plugin-sdk/sqlite-runtime");
+    const firstRead = createDeferred<void>();
+    const firstResult = createDeferred<null>();
+    const closing = createDeferred<void>();
     const closed = createDeferred<void>();
     const execute = vi
       .fn(async (): Promise<string | null> => "recovered-guid")
-      .mockResolvedValueOnce(null);
-    const close = vi.fn(() => closed.promise);
+      .mockImplementationOnce(() => {
+        firstRead.resolve();
+        return firstResult.promise;
+      });
+    const close = vi.fn(() => {
+      closing.resolve();
+      return closed.promise;
+    });
     const store = { execute, close } satisfies SqliteWorkerStore<SqliteWorkerOperations>;
     const open = vi.spyOn(sqliteRuntime, "openSqliteWorkerStore").mockResolvedValue(store);
     const client = new IMessageRpcClient({ dbPath });
@@ -79,16 +87,20 @@ describe("iMessage send SQLite receipt recovery", () => {
       return result;
     });
     try {
-      await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+      // Send persistence uses real workers; synchronize on reads without freezing their timers.
+      await Promise.race([firstRead.promise, sending]);
+      expect(execute).toHaveBeenCalledOnce();
       expect(close).not.toHaveBeenCalled();
-      await vi.advanceTimersByTimeAsync(250);
-      await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
+      firstResult.resolve(null);
+      await Promise.race([closing.promise, sending]);
+      expect(close).toHaveBeenCalledOnce();
       expect(execute).toHaveBeenCalledTimes(2);
       expect(open).toHaveBeenCalledOnce();
       expect(settled).toBe(false);
       closed.resolve();
       await expect(sending).resolves.toMatchObject({ guid: "recovered-guid" });
     } finally {
+      firstResult.resolve(null);
       closed.resolve();
       await sending;
     }
@@ -102,13 +114,9 @@ describe("iMessage send SQLite receipt recovery", () => {
     { kind: "handle", target: "+1 (555) 000-1111", timeout: true },
   ])(
     "recovers $kind through the default resolver off the caller thread",
-    async ({ kind, target, timeout }) => {
+    async ({ target, timeout }) => {
       const close = vi.spyOn(DatabaseSync.prototype, "close");
-      const exec = vi.spyOn(DatabaseSync.prototype, "exec");
       const get = vi.spyOn(StatementSync.prototype, "get");
-      const all = vi.spyOn(StatementSync.prototype, "all");
-      const iterate = vi.spyOn(StatementSync.prototype, "iterate");
-      const run = vi.spyOn(StatementSync.prototype, "run");
       const prepareCalls = vi.spyOn(DatabaseSync.prototype, "prepare");
       const countMessageSelects = () =>
         prepareCalls.mock.calls.filter(([sql]) =>
@@ -146,7 +154,6 @@ describe("iMessage send SQLite receipt recovery", () => {
       } else {
         request.mockResolvedValue({ message_id: 6 });
       }
-      const before = performance.now();
       const result = await sendMessageIMessage(target, "synthetic receipt", {
         config: { channels: { imessage: {} } },
         client,
@@ -161,22 +168,6 @@ describe("iMessage send SQLite receipt recovery", () => {
             }
           : {}),
       });
-      console.info(
-        JSON.stringify({
-          kind,
-          elapsedMs: performance.now() - before,
-          parentMessageSelects: countMessageSelects(),
-          parentSendNativeCalls: {
-            prepare: prepareCalls.mock.calls.length,
-            exec: exec.mock.calls.length,
-            close: close.mock.calls.length,
-            get: get.mock.calls.length,
-            all: all.mock.calls.length,
-            iterate: iterate.mock.calls.length,
-            run: run.mock.calls.length,
-          },
-        }),
-      );
       expect(result.guid).toBe("recovered-guid");
       expect(result.messageId).toBe(timeout ? "recovered-guid" : "6");
       expect(result.receipt.platformMessageIds).toEqual([timeout ? "recovered-guid" : "6"]);

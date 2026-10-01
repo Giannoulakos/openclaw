@@ -1,4 +1,3 @@
-// QA Lab Slack presentation and progress scenario fixtures.
 import { randomUUID } from "node:crypto";
 import {
   SLACK_QA_CHART_TITLE,
@@ -270,7 +269,9 @@ export function buildSlackProgressCommentaryRun(
             (message) =>
               [toolMarker, outputMarker].some((marker) =>
                 observedSlackText(message).includes(marker),
-              ) || hasSlackExecHeader(message),
+              ) ||
+              hasSlackExecHeader(message) ||
+              /\bsleep\s+5\b/u.test(observedSlackText(message)),
           )
           .map((message) => message.ts),
       );
