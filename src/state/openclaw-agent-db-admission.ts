@@ -18,7 +18,10 @@ import { registerDeferredSqliteWalWriteAdmission } from "../infra/sqlite-wal-wri
 import { requestSqliteWorkerOperationAdmission } from "../infra/sqlite-worker-operation-admission.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import { createDeferredCore } from "../shared/deferred.js";
-import { assertAgentCreationClaimAccess } from "./agent-creation-claim.js";
+import {
+  assertAgentCreationClaimAccess,
+  assertAgentCreationClaimCurrent,
+} from "./agent-creation-claim.js";
 import { assertAgentDatabaseAdmitted } from "./agent-database-admission.js";
 import {
   assertAgentDeletionDatabaseCleanupAccess,
@@ -441,6 +444,7 @@ export function createOpenClawAgentDatabaseAdmissionOwner(
       throw new Error(`Agent database open was replaced: ${pathname}`);
     }
     // Cleanup may end during the native check; reject before schema repair can resume.
+    assertAgentCreationClaimCurrent(options);
     getAgentDeletionDatabaseCleanup(options)?.assertCurrent();
     pending.assertHeld?.();
     if (database) {

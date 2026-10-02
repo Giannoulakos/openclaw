@@ -48,7 +48,7 @@ import { writeConfigMachineState } from "../state/config-machine-state-write.js"
 import {
   closeOpenClawAgentDatabasesForTest,
   getOpenClawAgentDatabaseIfOpen,
-  listOpenClawAgentDatabasesForTest,
+  isOpenClawAgentDatabaseOpen,
   openOpenClawAgentDatabase,
   runOpenClawAgentWriteTransaction,
 } from "../state/openclaw-agent-db.js";
@@ -713,8 +713,8 @@ it.each(["commit", "rollback", "close-failure"] as const)(
         config: {},
         agentDir,
       });
-    const openWorkDatabases = () =>
-      listOpenClawAgentDatabasesForTest().filter((database) => database.agentId === "work");
+    const isWorkDatabaseOpen = () =>
+      isOpenClawAgentDatabaseOpen(resolveAuthProfileDatabasePath(agentDir));
     try {
       const creation = createAgent({
         name: "work",
@@ -780,7 +780,7 @@ it.each(["commit", "rollback", "close-failure"] as const)(
           provider: "openai",
         });
         // Creation owned its handles only until publication; ordinary writers reopen freely.
-        expect(openWorkDatabases()).toEqual([]);
+        expect(isWorkDatabaseOpen()).toBe(false);
         await writeOutsideCreation();
         expect(readProfiles()["openai:after"]).toMatchObject({ type: "api_key" });
       } else {
@@ -805,9 +805,9 @@ it.each(["commit", "rollback", "close-failure"] as const)(
           throw new Error("Auth staging did not capture its creation context");
         }
         await expect(retainedCreation(writeOutsideCreation)).rejects.toThrow(
-          "agent work is deleted",
+          "Agent creation claim is no longer active",
         );
-        expect(openWorkDatabases()).toEqual([]);
+        expect(isWorkDatabaseOpen()).toBe(false);
         expect(readProfiles()["openai:after"]).toBeUndefined();
         expect(readAgentDeletionJournal("work")).toMatchObject({ cleanupCompleted: true });
       }

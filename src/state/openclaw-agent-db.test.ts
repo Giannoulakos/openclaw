@@ -12,6 +12,7 @@ import { requireNodeSqlite } from "../infra/node-sqlite.js";
 import * as nodeSqlite from "../infra/node-sqlite.js";
 import { listOpenFileDescriptorsForPath } from "../infra/open-file-descriptors.test-support.js";
 import { resolveRuntimeWorkerArgv, resolveRuntimeWorkerUrl } from "../infra/runtime-worker-url.js";
+import * as integrityWorker from "../infra/sqlite-integrity-worker.js";
 import { readSqliteNumberPragma } from "../infra/sqlite-pragma.test-support.js";
 import { migrateLegacyMediaPersistence } from "../infra/state-migrations.media-persistence.js";
 import { VERSION } from "../version.js";
@@ -66,6 +67,7 @@ import {
 import { removeCanonicalValidationFromHistoricalAgentFixture } from "./openclaw-agent-db.test-support.js";
 import { materializeV21WorkerAgentDatabase } from "./openclaw-agent-schema-v21.test-support.js";
 import { OPENCLAW_AGENT_SCHEMA_SQL } from "./openclaw-agent-schema.js";
+import { clearOpenClawAgentIntegrityVerification } from "./openclaw-quarantine-store.js";
 import {
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
@@ -2545,6 +2547,14 @@ describe("openclaw agent database", () => {
     const outsideCreation = AsyncLocalStorage.snapshot();
     const aliasStateEnv = { OPENCLAW_STATE_DIR: createTempStateDir() };
     const aliasDir = path.join(aliasStateEnv.OPENCLAW_STATE_DIR, "agent-alias");
+    const openAliasOutside = () =>
+      outsideCreation(() =>
+        openOpenClawAgentDatabase({
+          agentId: "worker-1",
+          path: path.join(aliasDir, "openclaw-agent.sqlite"),
+          env: aliasStateEnv,
+        }),
+      );
     const settled = createDeferred();
     let retainedClaim: Promise<string> | undefined;
 
@@ -2555,15 +2565,7 @@ describe("openclaw agent database", () => {
         "active agent creation claim",
       );
       fs.symlinkSync(agentDir, aliasDir, "junction");
-      expect(() =>
-        outsideCreation(() =>
-          openOpenClawAgentDatabase({
-            agentId: "worker-1",
-            path: path.join(aliasDir, "openclaw-agent.sqlite"),
-            env: aliasStateEnv,
-          }),
-        ),
-      ).toThrow("active agent creation claim");
+      expect(openAliasOutside).toThrow("active agent creation claim");
       // A continuation retained past settlement keeps this store but no authority.
       retainedClaim = settled.promise.then(claimAsWorker);
     });
@@ -2587,7 +2589,81 @@ describe("openclaw agent database", () => {
     });
     expect(isOpenClawAgentDatabaseOpen(databasePath)).toBe(false);
 
-    // A failed creation still settles its handles before the error surfaces.
+    // Retiring a claim during a real integrity read must precede index repair, not only exposure.
+    clearOpenClawAgentIntegrityVerification(databasePath, env);
+    const editor = nodeSqlite.openNodeSqliteDatabase(databasePath);
+    try {
+      editor.exec("DROP INDEX idx_agent_cache_expiry");
+    } finally {
+      editor.close();
+    }
+    const checked = createDeferred();
+    const resume = createDeferred();
+    const releaseReceipt = createDeferred();
+    const closeStarted = createDeferred();
+    const check = integrityWorker.assertSqliteIntegrityInWorker;
+    const checkSpy = vi
+      .spyOn(integrityWorker, "assertSqliteIntegrityInWorker")
+      .mockImplementation(async (...args) => {
+        await check(...args);
+        const signal = args[2];
+        if (!signal) {
+          throw new Error("Native admission did not supply its cancellation signal");
+        }
+        const onAbort = () => closeStarted.resolve();
+        if (signal.aborted) {
+          onAbort();
+        } else {
+          signal.addEventListener("abort", onAbort, { once: true });
+        }
+        checked.resolve();
+        try {
+          await resume.promise;
+        } finally {
+          signal.removeEventListener("abort", onAbort);
+        }
+      });
+    let rejected: Promise<unknown> | undefined;
+    let operationCalled = false;
+    const retiring = runWithAgentCreationClaim({ agentId: "worker-1", env }, async () => {
+      rejected = expect(
+        withOpenClawAgentDatabaseAsync(options, () => {
+          operationCalled = true;
+        }),
+      ).rejects.toThrow();
+      await releaseReceipt.promise;
+    });
+    try {
+      await checked.promise;
+      expect(openAliasOutside).toThrow("active agent creation claim");
+      releaseReceipt.resolve();
+      await closeStarted.promise;
+      expect(openAliasOutside).toThrow("active agent creation claim");
+      expect(() => assertNoOpenClawAgentDatabaseLeases("worker-1", { env })).toThrow(
+        "database is still open",
+      );
+    } finally {
+      releaseReceipt.resolve();
+      resume.resolve();
+      try {
+        await retiring;
+        await rejected;
+      } finally {
+        checkSpy.mockRestore();
+      }
+    }
+    const reader = nodeSqlite.openNodeSqliteDatabase(databasePath, { readOnly: true });
+    try {
+      expect(
+        reader.prepare("SELECT name FROM sqlite_schema WHERE name='idx_agent_cache_expiry'").get(),
+      ).toBeUndefined();
+    } finally {
+      reader.close();
+    }
+    expect(operationCalled).toBe(false);
+    expect(() => assertNoOpenClawAgentDatabaseLeases("worker-1", { env })).not.toThrow();
+
+    // A fresh claim can repair the index and write, then still close if its body fails.
     await expect(
       runWithAgentCreationClaim({ agentId: "worker-1", env }, async () => {
         writeMarker("failed");

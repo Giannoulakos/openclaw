@@ -34,7 +34,9 @@ import { normalizeAgentId } from "../routing/session-key.js";
 import {
   assertAgentCreationClaimAccess,
   assertAgentCreationClaimAliases,
+  assertAgentCreationClaimCurrent,
   registerAgentCreationClaimHandle,
+  reserveAgentCreationClaimAdmission,
 } from "./agent-creation-claim.js";
 import { assertAgentDatabaseAdmitted } from "./agent-database-admission.js";
 import {
@@ -222,6 +224,7 @@ function* openOpenClawAgentDatabaseSteps(
     }
   };
   assertCurrent();
+  assertAgentCreationClaimCurrent(databaseOptions);
   getAgentDeletionDatabaseCleanup(databaseOptions)?.assertCurrent();
   const incognito = isIncognitoOpenClawAgentSqlitePath(pathname, databaseOptions);
   // A live successful cache entry is authoritative; failed entries remain only for disposal.
@@ -351,6 +354,7 @@ function* openOpenClawAgentDatabaseSteps(
   let openedDb: DatabaseSync | undefined;
   let openedDatabase: OpenClawAgentDatabase | undefined;
   let openedWalMaintenance: SqliteWalMaintenance | undefined;
+  let releaseCreationAdmission: (() => void) | undefined;
   try {
     assertCurrent();
     if (!repairAdmission?.expectedIdentity) {
@@ -390,6 +394,15 @@ function* openOpenClawAgentDatabaseSteps(
       assertSupportedAgentSchemaVersion(db, pathname);
       const existingSchema = readExistingAgentSchemaMeta(db);
       assertExistingAgentSchemaOwner(existingSchema, agentId, pathname);
+      if (pending) {
+        releaseCreationAdmission = reserveAgentCreationClaimAdmission(
+          pending,
+          databaseOptions,
+          async () => {
+            await closeOpenClawAgentDatabaseByPathAsync(pathname, agentId);
+          },
+        );
+      }
       // Runtime proof survives last-lease close; cold opens require clean-close proof.
       // Runtime proof carries owner revocation; every open still checks schema convergence.
       diagnostics.integrityGateReason = resolveAgentDatabaseIntegrityGateReason(
@@ -513,6 +526,7 @@ function* openOpenClawAgentDatabaseSteps(
     getOpenClawDatabaseMaintenanceScope()?.own(database.db, "agent-handles", () =>
       closeMaintenanceAgentDatabase(database),
     );
+    releaseCreationAdmission?.();
     return database;
   } catch (error) {
     let closeError: unknown;

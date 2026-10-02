@@ -17,6 +17,7 @@ type AgentCreationClaimScope = {
   registerClose: (close: () => Promise<void>) => void;
   retryClose: () => Promise<void>;
 };
+type AgentCreationClaimResource = Pick<OpenClawAgentDatabase, "agentId" | "path">;
 
 // Only a creation receipt may admit its identity beneath a completed tombstone.
 // Failed disposal retains handle custody, never the expired scope's write authority.
@@ -24,9 +25,9 @@ const creationClaim = resolveGlobalSingleton(
   Symbol.for("openclaw.agentCreationClaim"),
   () => new AsyncLocalStorage<AgentCreationClaimScope>(),
 );
-const creationHandles = resolveGlobalSingleton(
-  Symbol.for("openclaw.agentCreationClaimHandles"),
-  () => new Map<OpenClawAgentDatabase, AgentCreationClaimScope>(),
+const creationResources = resolveGlobalSingleton(
+  Symbol.for("openclaw.agentCreationClaimResources"),
+  () => new Map<AgentCreationClaimResource, AgentCreationClaimScope>(),
 );
 
 /** Runs creation-owned staging that may write the recreated identity's databases. */
@@ -80,7 +81,7 @@ export async function runWithAgentCreationClaim<T>(
     let outcome: Result<T, unknown>;
     const closeErrors: unknown[] = [];
     try {
-      for (const previous of new Set(creationHandles.values())) {
+      for (const previous of new Set(creationResources.values())) {
         if (previous.agentId === scope.agentId && previous.statePath === scope.statePath) {
           await previous.retryClose();
         }
@@ -131,6 +132,33 @@ export function resolveAgentCreationClaimAgentId(
   return getActiveAgentCreationClaim(claimAgentId, statePath)?.agentId;
 }
 
+/** Hold pending native custody until publication hands it to the handle, or disposal succeeds. */
+export function reserveAgentCreationClaimAdmission(
+  admission: AgentCreationClaimResource,
+  options: OpenClawAgentDatabaseOptions,
+  close: () => Promise<void>,
+): (() => void) | undefined {
+  const scope = getActiveAgentCreationClaim(
+    options.agentId,
+    resolveOpenClawStateSqlitePath(options.env ?? process.env),
+  );
+  if (!scope) {
+    return undefined;
+  }
+  creationResources.set(admission, scope);
+  scope.registerClose(async () => {
+    if (creationResources.get(admission) !== scope) {
+      return;
+    }
+    // The reservation fences new admissions until the native owner joins cleanup.
+    await close();
+    creationResources.delete(admission);
+  });
+  return () => {
+    creationResources.delete(admission);
+  };
+}
+
 /** Tag a freshly opened handle as owned by the live creation scope for its identity. */
 export function registerAgentCreationClaimHandle(
   database: OpenClawAgentDatabase,
@@ -141,17 +169,18 @@ export function registerAgentCreationClaimHandle(
     resolveOpenClawStateSqlitePath(options.env ?? process.env),
   );
   if (scope) {
-    creationHandles.set(database, scope);
+    creationResources.set(database, scope);
   }
   return scope;
 }
 
 /** Refuse a creation-owned handle to every caller outside that same live scope. */
 export function assertAgentCreationClaimAccess(
-  database: OpenClawAgentDatabase,
+  database: AgentCreationClaimResource,
   options: OpenClawAgentDatabaseOptions,
 ): void {
-  const owner = creationHandles.get(database);
+  assertAgentCreationClaimCurrent(options);
+  const owner = creationResources.get(database);
   if (!owner) {
     return;
   }
@@ -164,13 +193,26 @@ export function assertAgentCreationClaimAccess(
   }
 }
 
+/** A retained admission must stop before resuming native work after settlement. */
+export function assertAgentCreationClaimCurrent(options: OpenClawAgentDatabaseOptions): void {
+  const scope = creationClaim.getStore();
+  if (
+    scope &&
+    !scope.isActive() &&
+    scope.agentId === normalizeAgentId(options.agentId) &&
+    scope.statePath === path.resolve(resolveOpenClawStateSqlitePath(options.env ?? process.env))
+  ) {
+    throw new Error("Agent creation claim is no longer active.");
+  }
+}
+
 /** A different spelling or state root must not borrow a creation-owned physical store. */
 export function assertAgentCreationClaimAliases(
   options: OpenClawAgentDatabaseOptions,
   isSamePath: (left: string, right: string) => boolean,
 ): void {
   const pathname = resolveOpenClawAgentSqlitePath(options);
-  for (const owned of creationHandles.keys()) {
+  for (const owned of creationResources.keys()) {
     if (isSamePath(owned.path, pathname)) {
       assertAgentCreationClaimAccess(owned, options);
     }
@@ -179,5 +221,5 @@ export function assertAgentCreationClaimAliases(
 
 /** Release the tag once the native owner has closed the handle. */
 export function releaseAgentCreationClaimHandle(database: OpenClawAgentDatabase): void {
-  creationHandles.delete(database);
+  creationResources.delete(database);
 }
